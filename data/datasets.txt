@@ -1,0 +1,34 @@
+# https://data.sdss.org/sas/dr19/vac/mos/DL1_SDSS_eROSITA/v1_0_2/
+>> wget https://data.sdss.org/sas/dr19/vac/mos/DL1_SDSS_eROSITA/v1_0_2/DL1_spec_SDSSV_eROSITA_eRASS1-v1_0_2.fits 
+
+# https://cdsarc.cds.unistra.fr/ftp/J/A+A/691/A240/
+>> # Descarga los archivos p.dat (Redshifts y Flags)
+files_p=(
+    "ceersp.dat.gz"
+    "ngdeepp.dat.gz"
+    "primerup.dat.gz"
+    "primercp.dat.gz"
+    "jadesgsp.dat.gz"
+    "jadesgnp.dat.gz"
+    "a2744p.dat.gz"
+)
+
+for file in "${files_p[@]}"; do
+    echo "Descargando $file..."
+    wget "https://cdsarc.cds.unistra.fr/ftp/J/A+A/691/A240/$file"
+done
+>> # Descarga los archivos o.dat (fotometría completa)
+files_o=(
+    "ceerso.dat.gz"
+    "ngdeepo.dat.gz"
+    "primeruo.dat.gz"
+    "primerco.dat.gz"
+    "jadesgso.dat.gz"
+    "jadesgno.dat.gz"
+    "a2744o.dat.gz"
+)
+
+for file in "${files_o[@]}"; do
+    echo "Descargando $file..."
+    wget "https://cdsarc.cds.unistra.fr/ftp/J/A+A/691/A240/$file"
+done
