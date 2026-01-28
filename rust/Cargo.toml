@@ -1,0 +1,21 @@
+[package]                  
+name = "vpm_engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]                      
+name = "vpm_engine"        
+crate-type = ["cdylib"]
+
+[dependencies]
+ndarray = { version = "0.15", features = ["rayon"] }
+pyo3 = { version = "0.20", features = ["extension-module"] }
+rand = "0.8"
+itertools = "0.10"
+num-complex = "0.4"
+rustfft = "6.0"         # AÑADIDO
+rayon = "1.11"          # AÑADIDO
+lazy_static = "1.4"     # AÑADIDO (para planificador FFT estático)
+
+[build-dependencies]
+pyo3-build-config = "0.20"
