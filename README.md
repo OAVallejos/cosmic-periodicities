@@ -42,7 +42,7 @@ JWST: Bouwens et al. (2023) photometry from 7 fields (CEERS, PRIMER, JADES, etc.
 ## 📜 Citation
 If you use this code or data, please cite:
 
-> Vallejos, O. A. (2026). *Evidence for Cosmic Harmonic Periodicity in Galaxy Evolution*. DOI: 10.5281/zenodo.18406995
+> Vallejos, O. A. (2026). Evidence for Cosmic Harmonic Periodicity in Galaxy. (v1.0). Zenodo. https://doi.org/10.5281/zenodo.18406995
 
 
 Created by Omar Ariel Vallejos. Contact: arielvallejosok@gmail.com
