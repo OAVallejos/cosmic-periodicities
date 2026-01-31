@@ -44,5 +44,5 @@ If you use this code or data, please cite:
 
 > Vallejos, O. A. (2026). Evidence for Cosmic Harmonic Periodicity in Galaxy. (v1.0). Zenodo. https://doi.org/10.5281/zenodo.18406995
 
+Evidence for Cosmic Harmonic Periodicity in Galaxy. (v1.2). Zenodo. https://doi.org/10.5281/zenodo.18445297
 
-Created by Omar Ariel Vallejos. Contact: arielvallejosok@gmail.com
