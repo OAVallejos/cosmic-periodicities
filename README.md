@@ -60,3 +60,4 @@ If you use this code or data, please cite:
 
 Evidence for Cosmic Harmonic Periodicity in Galaxy. (v1.2). Zenodo. https://doi.org/10.5281/zenodo.18445297
 
+Discovery of Cosmic Crystal Structure at High Redshift. (v1.3). Zenodo. https://doi.org/10.5281/zenodo.18475085
