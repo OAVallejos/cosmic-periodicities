@@ -39,6 +39,20 @@ Rust (Cargo)
 SDSS/eROSITA: Cross-matched catalogs (DR19 + eRASS1).
 JWST: Bouwens et al. (2023) photometry from 7 fields (CEERS, PRIMER, JADES, etc.).
 
+
+# preprint (v1.0)
+JWST_A.py            
+JWST_B.py
+eROSITA_fits_csv.py
+eROSITA_OMEGA.py
+
+
+# preprint (v1.2)
+FUNCTION_JWST.py 
+COEFICCIENT_JWST.py   
+DERIVATIVE_PLOT.py 
+
+
 ## 📜 Citation
 If you use this code or data, please cite:
 
