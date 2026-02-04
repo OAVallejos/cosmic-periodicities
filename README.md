@@ -52,6 +52,14 @@ FUNCTION_JWST.py
 COEFICCIENT_JWST.py   
 DERIVATIVE_PLOT.py 
 
+# preprint (v1.3)
+lib_rs.txt
+STRUCTURE_JWST.py
+STRUCTURE_JWST_v2.py
+OSC_JWST.py
+OSC_JWST_v3.py
+
+
 
 ## 📜 Citation
 If you use this code or data, please cite:
