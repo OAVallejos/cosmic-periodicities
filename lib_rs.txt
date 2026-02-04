@@ -1,0 +1,234 @@
+use pyo3::prelude::*;
+use pyo3::exceptions::{PyValueError, PyIOError};      
+use std::fs::File;         
+use std::io::{BufRead, BufReader};                    
+use flate2::read::GzDecoder;
+
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct HonestBirefringence {
+    pub c: [f64; 6],
+    pub omega0: f64,
+    pub z_min_observed: f64,
+    pub z_max_observed: f64,
+    pub alpha_fine_structure: f64,
+}
+
+#[pymethods]
+impl HonestBirefringence {
+    #[new]
+    fn new(
+        c: [f64; 6],
+        omega0: f64,
+        z_min_observed: f64,
+        z_max_observed: f64,
+    ) -> Self {
+        HonestBirefringence {
+            c,
+            omega0,
+            z_min_observed,
+            z_max_observed,
+            alpha_fine_structure: 1.0 / 137.035999084,
+        }
+    }
+
+    /// Carga y filtra galaxias directamente desde el .dat.gz
+    #[pyo3(text_signature = "(path, z_centro, ancho_z)")]
+    fn extraer_datos_reales(
+        &self,
+        path: String,
+        z_centro: f64,
+        ancho_z: f64
+    ) -> PyResult<Vec<(f64, f64, f64)>> {
+        let file = File::open(&path).map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let decoder = GzDecoder::new(file);
+        let reader = BufReader::new(decoder);
+        let mut galaxias = Vec::new();
+        let mut lineas_procesadas = 0;
+        let mut lineas_aceptadas = 0;
+
+        for line in reader.lines() {
+            let l = line.map_err(|e| PyIOError::new_err(e.to_string()))?;
+            lineas_procesadas += 1;
+
+            for chunk in l.split_whitespace().collect::<Vec<&str>>().chunks(9) {
+                if chunk.len() < 5 {
+                    continue;
+                }
+
+                let ra = match chunk[1].parse::<f64>() {
+                    Ok(val) => val,
+                    Err(_) => continue,
+                };
+
+                let dec = match chunk[2].parse::<f64>() {
+                    Ok(val) => val,
+                    Err(_) => continue,
+                };
+
+                let z = match chunk[4].parse::<f64>() {
+                    Ok(val) => val,
+                    Err(_) => continue,
+                };
+
+                if z < 0.01 || z > 19.9 || (z - 20.0).abs() < 0.1 {
+                    continue;
+                }
+
+                if (z - z_centro).abs() <= ancho_z {
+                    galaxias.push((ra, dec, z));
+                    lineas_aceptadas += 1;
+                }
+            }
+        }
+
+        println!("[Rust] Procesadas: {} líneas, Aceptadas: {} galaxias",
+                 lineas_procesadas, lineas_aceptadas);
+
+        Ok(galaxias)
+    }
+
+    fn phi_z(&self, z: f64) -> f64 {
+        let mut result = self.c[5];
+        result = result * z + self.c[4];
+        result = result * z + self.c[3];
+        result = result * z + self.c[2];
+        result = result * z + self.c[1];
+        result = result * z + self.c[0];
+        result
+    }
+
+    fn omega_z(&self, z: f64) -> f64 {
+        let mut result = self.c[5] * 5.0;
+        result = result * z + self.c[4] * 4.0;
+        result = result * z + self.c[3] * 3.0;
+        result = result * z + self.c[2] * 2.0;
+        result = result * z + self.c[1];
+        result
+    }
+
+    fn omega_eff_z(&self, z: f64) -> f64 {
+        let n = if z > 5.0 {
+            6.0
+        } else if z > 1.5 {
+            4.0
+        } else {
+            1.0
+        };
+
+        self.omega_z(z) * n / (1.0 + z)
+    }
+
+    #[pyo3(text_signature = "(galaxias)")]
+    fn analizar_nodo(&self, galaxias: Vec<(f64, f64, f64)>) -> PyResult<Vec<f64>> {
+        if galaxias.is_empty() {
+            return Err(PyValueError::new_err("Lista de galaxias vacía"));
+        }
+
+        let mut redshifts: Vec<f64> = galaxias.iter().map(|&(_, _, z)| z).collect();
+        redshifts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let n = redshifts.len();
+        let mean_z = redshifts.iter().sum::<f64>() / n as f64;
+        let std_z = (redshifts.iter()
+            .map(|&z| (z - mean_z).powi(2))
+            .sum::<f64>() / n as f64).sqrt();
+
+        let phases: Vec<f64> = redshifts.iter()
+            .map(|&z| self.phi_z(z))
+            .collect();
+
+        let cos_sum: f64 = phases.iter().map(|&phi| phi.cos()).sum();
+        let sin_sum: f64 = phases.iter().map(|&phi| phi.sin()).sum();
+        let r = (cos_sum.powi(2) + sin_sum.powi(2)).sqrt() / n as f64;
+
+        let resultados = vec![
+            mean_z,
+            std_z,
+            n as f64,
+            r,
+            self.phi_z(mean_z),
+            self.omega_z(mean_z),
+            // Se ha eliminado el cálculo de beta aquí
+        ];
+
+        Ok(resultados)
+    }
+
+    fn honest_statement(&self) -> PyResult<String> {
+        if self.z_min_observed < 0.0 || self.z_max_observed < self.z_min_observed {
+            return Err(PyValueError::new_err("Rango de redshift inválido"));
+        }
+
+        if self.omega0 <= 0.0 {
+            return Err(PyValueError::new_err("ω₀ debe ser positivo"));
+        }
+
+        // CORRECCIÓN: Crear líneas con separadores manualmente
+        let separator = "═".repeat(60);
+
+        Ok(format!(
+            "{}\n\
+             ANÁLISIS DE RIGOR CIENTÍFICO - BIRREFERENCIA COSMOLÓGICA\n\
+             {}\n\
+             \n\
+             📊 PARÁMETROS DEL MODELO:\n\
+             • Rango observado: z = [{:.2}, {:.2}]\n\
+             • Frecuencia fundamental: ω₀ = {:.6}\n\
+             • Constante estructura fina: α = {:.12}\n\
+             \n\
+             ⚠️  NOTAS METODOLÓGICAS:\n\
+             • Cálculo de fase: φ(z) = polinomio en z\n\
+             • Frecuencia efectiva: Ω_eff(z) = Ω(z) * n(z) / (1+z)\n\
+             • n(z) escalado: 1.0 (z<1.5), 4.0 (1.5<z<5), 6.0 (z>5)\n\
+             {}",
+            separator,
+            separator,
+            self.z_min_observed, self.z_max_observed,
+            self.omega0,
+            self.alpha_fine_structure,
+            separator
+        ))
+    }
+
+    #[getter]
+    fn get_alpha_fine_structure(&self) -> f64 {
+        self.alpha_fine_structure
+    }
+
+    #[setter]
+    fn set_alpha_fine_structure(&mut self, value: f64) -> PyResult<()> {
+        if value <= 0.0 || value > 1.0 {
+            return Err(PyValueError::new_err(
+                "La constante de estructura fina debe estar en (0, 1]"
+            ));
+        }
+        self.alpha_fine_structure = value;
+        Ok(())
+    }
+
+    fn to_json(&self) -> PyResult<String> {
+        let json = format!(
+            r#"{{
+                "c": [{:.12}, {:.12}, {:.12}, {:.12}, {:.12}, {:.12}],
+                "omega0": {:.12},
+                "z_range": [{:.6}, {:.6}],
+                "alpha": {:.12}
+            }}"#,
+            self.c[0], self.c[1], self.c[2], self.c[3], self.c[4], self.c[5],
+            self.omega0,
+            self.z_min_observed, self.z_max_observed,
+            self.alpha_fine_structure
+        );
+        Ok(json)
+    }
+}
+
+#[pymodule]
+fn honest_beta_engine(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<HonestBirefringence>()?;
+    
+    m.add("ALPHA_FINE_STRUCTURE", 1.0 / 137.035999084)?;
+
+    Ok(())
+}
