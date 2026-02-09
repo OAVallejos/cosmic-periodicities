@@ -59,6 +59,16 @@ STRUCTURE_JWST_v2.py
 OSC_JWST.py
 OSC_JWST_v3.py
 
+# preprint (v1.4)
+CCv8.py
+CCv8_1.py
+CCv8_2.py
+CCv8_3.py
+CCv8_4.py
+CCv0_4.py
+cristal_core.txt (kernel Rust) 
+# dataset: SDSS DESI
+
 
 
 ## 📜 Citation
