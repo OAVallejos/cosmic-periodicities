@@ -1,0 +1,1805 @@
+use pyo3::prelude::*;
+use pyo3::exceptions::{PyValueError, PyRuntimeError};
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::f64::consts::PI;
+use rand::Rng;
+use ordered_float::OrderedFloat;
+use std::collections::BinaryHeap;
+use std::cmp::Reverse;
+
+// Constantes de Vallejos V1.2/V1.3
+const PHI_COEFFS: [f64; 6] = [0.1800, 18.9775, -0.0404, -0.4247, 0.0940, -0.0055];
+const OMEGA_0: f64 = 0.191;  // Gyr⁻¹
+const LAMBDA_SCALE: f64 = 1682.0;  // Mpc
+
+// Constantes cosmológicas
+const C_LIGHT: f64 = 299792.458;  // km/s
+const H0_DEFAULT: f64 = 70.0;     // km/s/Mpc
+
+// =================================================================
+// FUNCIONES DE APOYO
+// =================================================================
+
+fn erf_approx(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let p = 0.3275911;
+    
+    let t = 1.0 / (1.0 + p * x);
+    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
+    
+    sign * y
+}
+
+fn distancia_angular(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
+    let ra1_rad = ra1.to_radians();
+    let dec1_rad = dec1.to_radians();
+    let ra2_rad = ra2.to_radians();
+    let dec2_rad = dec2.to_radians();
+    
+    let d_dec = dec2_rad - dec1_rad;
+    let d_ra = ra2_rad - ra1_rad;
+    
+    let a = (d_dec / 2.0).sin().powi(2) 
+        + dec1_rad.cos() * dec2_rad.cos() * (d_ra / 2.0).sin().powi(2);
+    
+    2.0 * a.sqrt().asin()
+}
+
+fn distancia_comovil(z: f64, h0: f64) -> f64 {
+    (C_LIGHT / h0) * (1.0 + z).ln()
+}
+
+// =================================================================
+// ESTRUCTURAS DE DATOS PARA ANÁLISIS HEXAGONAL
+// =================================================================
+
+#[derive(Debug, Clone)]
+struct HexagonalNode {
+    ra: f64,
+    dec: f64,
+    z: f64,
+    centroides: Vec<[f64; 2]>,  // Posiciones de los vértices [RA, DEC]
+    vdisp_centro: f64,
+    vdisp_vertices: Vec<f64>,
+    error_hexagonal: f64,
+    ratio_hexagonal: f64,
+    score: f64,
+    n_vertices: usize,
+}
+
+// =================================================================
+// CLASE PRINCIPAL
+// =================================================================
+
+#[pyclass]
+#[derive(Clone)]
+pub struct CristalStacker {
+    #[pyo3(get, set)]
+    pub omega_0: f64,
+    #[pyo3(get, set)]
+    pub lambda_scale: f64,
+    #[pyo3(get, set)]
+    pub search_radius_mpc: f64,
+    #[pyo3(get, set)]
+    pub umbral_hexagonal_error: f64,  // Nuevo: umbral para detección hexagonal
+}
+
+#[pymethods]
+impl CristalStacker {
+    #[new]
+    fn new(omega_0: Option<f64>, lambda_scale: Option<f64>) -> Self {
+        CristalStacker {
+            omega_0: omega_0.unwrap_or(OMEGA_0),
+            lambda_scale: lambda_scale.unwrap_or(LAMBDA_SCALE),
+            search_radius_mpc: 420.5,  // λ/4
+            umbral_hexagonal_error: 25.0,  // 25% como en paper de Vallejos
+        }
+    }
+
+    // ==============================================
+    // 1. MÉTODOS BÁSICOS (existentes)
+    // ==============================================
+
+    fn fase_vallejos(&self, z: f64) -> f64 {
+        let mut result = PHI_COEFFS[5];
+        result = result.mul_add(z, PHI_COEFFS[4]);
+        result = result.mul_add(z, PHI_COEFFS[3]);
+        result = result.mul_add(z, PHI_COEFFS[2]);
+        result = result.mul_add(z, PHI_COEFFS[1]);
+        result = result.mul_add(z, PHI_COEFFS[0]);
+        result
+    }
+
+    fn psi_vallejos(&self, z: f64) -> f64 {
+        self.fase_vallejos(z).cos()
+    }
+
+    // ==============================================
+    // 2. ANÁLISIS HEXAGONAL AVANZADO (NUEVO - COMO EN PAPER DE VALLEJOS)
+    // ==============================================
+
+    /// Análisis hexagonal como en paper de Vallejos (sección II.B.1)
+    #[pyo3(signature = (galaxias, centro_ra, centro_dec, radio_grados, radio_interno_rel=0.5))]
+    fn analizar_hexagonal_completo(
+        &self,
+        galaxias: Vec<[f64; 4]>,  // [RA, Dec, Z, VDISP]
+        centro_ra: f64,
+        centro_dec: f64,
+        radio_grados: f64,
+        radio_interno_rel: Option<f64>,
+    ) -> PyResult<HashMap<String, f64>> {
+        if galaxias.is_empty() {
+            return Err(PyValueError::new_err("Lista de galaxias vacía"));
+        }
+
+        let radio_interno = radio_interno_rel.unwrap_or(0.5) * radio_grados;
+        
+        // 1. Proyección en plano tangente (Ecuación 1 del paper)
+        let coordenadas_proyectadas: Vec<[f64; 2]> = galaxias
+            .par_iter()
+            .map(|g| {
+                let ra = g[0];
+                let dec = g[1];
+                
+                let delta_ra = (ra - centro_ra) * 60.0 * centro_dec.to_radians().cos();
+                let delta_dec = (dec - centro_dec) * 60.0;
+                
+                [delta_ra, delta_dec]
+            })
+            .collect();
+
+        // 2. Filtrar galaxias dentro del radio
+        let mut galaxias_interior = Vec::new();
+        let mut galaxias_anillo = Vec::new();
+        
+        for (i, coord) in coordenadas_proyectadas.iter().enumerate() {
+            let dx = coord[0];
+            let dy = coord[1];
+            let distancia = (dx*dx + dy*dy).sqrt();
+            
+            if distancia < radio_interno {
+                galaxias_interior.push(i);
+            } else if distancia <= radio_grados * 60.0 {
+                galaxias_anillo.push(i);
+            }
+        }
+
+        // 3. Análisis de simetría hexagonal (Ecuación 2 del paper)
+        let mut error_hexagonal = 0.0;
+        let mut vertices_detectados = Vec::new();
+        
+        if galaxias_anillo.len() >= 6 {
+            // Crear KD-tree para búsqueda rápida de vecinos
+            let puntos_anillo: Vec<_> = galaxias_anillo
+                .iter()
+                .map(|&idx| [coordenadas_proyectadas[idx][0], coordenadas_proyectadas[idx][1]])
+                .collect();
+            
+            // 3.1 Rotar 60° y buscar coincidencias
+            for angulo_base in 0..6 {
+                let angulo_rad = (angulo_base as f64) * PI / 3.0;  // 60° en radianes
+                
+                let mejor_vertice = galaxias_anillo
+                    .iter()
+                    .min_by_key(|&&idx| {
+                        let dx = coordenadas_proyectadas[idx][0];
+                        let dy = coordenadas_proyectadas[idx][1];
+                        let angulo_actual = dy.atan2(dx);
+                        let diff = (angulo_actual - angulo_rad).abs();
+                        OrderedFloat(diff.min(2.0*PI - diff))
+                    });
+                
+                if let Some(&idx) = mejor_vertice {
+                    vertices_detectados.push(idx);
+                }
+            }
+            
+            // 3.2 Calcular error hexagonal
+            if vertices_detectados.len() >= 3 {
+                let mut errores = Vec::new();
+                
+                for &idx_vertice in &vertices_detectados {
+                    let x = coordenadas_proyectadas[idx_vertice][0];
+                    let y = coordenadas_proyectadas[idx_vertice][1];
+                    
+                    // Rotar 60°
+                    let x_rot = x * (PI/3.0).cos() - y * (PI/3.0).sin();
+                    let y_rot = x * (PI/3.0).sin() + y * (PI/3.0).cos();
+                    
+                    // Buscar vecino más cercano al punto rotado
+                    let mut min_dist = f64::MAX;
+                    for &idx_otro in &galaxias_anillo {
+                        if idx_otro == idx_vertice { continue; }
+                        
+                        let x2 = coordenadas_proyectadas[idx_otro][0];
+                        let y2 = coordenadas_proyectadas[idx_otro][1];
+                        
+                        let dist = ((x_rot - x2).powi(2) + (y_rot - y2).powi(2)).sqrt();
+                        if dist < min_dist {
+                            min_dist = dist;
+                        }
+                    }
+                    
+                    errores.push(min_dist);
+                }
+                
+                error_hexagonal = if !errores.is_empty() {
+                    errores.iter().sum::<f64>() / errores.len() as f64
+                } else {
+                    0.0
+                };
+            }
+        }
+
+        // 4. Detección de anillos (Ecuación 3 del paper)
+        let mut ratio_hexagonal = 0.0;
+        let mut anillos_detectados = 0;
+        
+        if vertices_detectados.len() >= 6 {
+            let mut distancias: Vec<f64> = vertices_detectados
+                .iter()
+                .map(|&idx| {
+                    let dx = coordenadas_proyectadas[idx][0];
+                    let dy = coordenadas_proyectadas[idx][1];
+                    (dx*dx + dy*dy).sqrt()
+                })
+                .collect();
+            
+            distancias.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            
+            // Buscar ratios ~√3 (1.732)
+            for i in 1..distancias.len() {
+                let ratio = distancias[i] / distancias[i-1];
+                if (ratio - 1.732).abs() < 0.4 {
+                    ratio_hexagonal = ratio;
+                    anillos_detectados += 1;
+                }
+            }
+        }
+
+        // 5. Calcular score hexagonal (Ecuación 4 del paper)
+        let mut score = 0.0;
+        let n_componentes = 5;
+        
+        if vertices_detectados.len() >= 4 {
+            // Componente 1: Error relativo
+            let error_rel = error_hexagonal / radio_grados;
+            let comp1 = (0.7 - error_rel / 0.5).max(0.0);
+            
+            // Componente 2: Ratio hexagonal
+            let comp2 = if ratio_hexagonal > 0.0 {
+                (0.6 - (ratio_hexagonal - 1.732).abs() / 0.5).max(0.0)
+            } else {
+                0.0
+            };
+            
+            // Componente 3: Regularidad angular
+            let mut angulos = Vec::new();
+            for &idx in &vertices_detectados {
+                let dx = coordenadas_proyectadas[idx][0];
+                let dy = coordenadas_proyectadas[idx][1];
+                let angulo = dy.atan2(dx);
+                angulos.push(angulo);
+            }
+            
+            angulos.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut diferencias = Vec::new();
+            for i in 0..angulos.len() {
+                let diff = (angulos[(i+1) % angulos.len()] - angulos[i]).abs();
+                diferencias.push(diff.min(2.0*PI - diff));
+            }
+            
+            let delta_theta = if !diferencias.is_empty() {
+                diferencias.iter().sum::<f64>() / diferencias.len() as f64
+            } else {
+                PI/3.0
+            };
+            
+            let comp3 = (0.5 - (delta_theta - PI/3.0).abs() / 40.0f64.to_radians()).max(0.0);
+            
+            // Componente 4: Anillos detectados
+            let comp4 = match anillos_detectados {
+                0 => 0.0,
+                1 => 0.2,
+                _ => 0.4,
+            };
+            
+            // Componente 5: Número de galaxias
+            let n_galaxias = galaxias.len() as f64;
+            let comp5 = if n_galaxias > 200.0 {
+                0.3
+            } else if n_galaxias > 50.0 {
+                0.15
+            } else {
+                0.0
+            };
+            
+            score = (comp1 + comp2 + comp3 + comp4 + comp5) / n_componentes as f64;
+        }
+
+        // 6. Coherencia multi-nodo (Ecuación 5 del paper)
+        let mut coherencia = 0.0;
+        if vertices_detectados.len() >= 4 {
+            coherencia = score * 0.9; // Simplificado
+        }
+
+        // 7. Preparar resultados
+        let mut resultados = HashMap::new();
+        resultados.insert("error_hexagonal".to_string(), error_hexagonal);
+        resultados.insert("error_relativo".to_string(), error_hexagonal / radio_grados);
+        resultados.insert("ratio_hexagonal".to_string(), ratio_hexagonal);
+        resultados.insert("score_hexagonal".to_string(), score);
+        resultados.insert("n_vertices".to_string(), vertices_detectados.len() as f64);
+        resultados.insert("anillos_detectados".to_string(), anillos_detectados as f64);
+        resultados.insert("coherencia".to_string(), coherencia);
+        resultados.insert("hexagonal_detectado".to_string(), 
+            if score > 0.3 && (error_hexagonal / radio_grados) < self.umbral_hexagonal_error / 100.0 {
+                1.0
+            } else {
+                0.0
+            });
+
+        Ok(resultados)
+    }
+
+    /// Detectar múltiples nodos hexagonales en un campo
+    #[pyo3(signature = (galaxias, candidatos_centros, radio_grados, min_score=0.3))]
+    fn detectar_nodos_hexagonales(
+        &self,
+        galaxias: Vec<[f64; 4]>,  // [RA, Dec, Z, VDISP]
+        candidatos_centros: Vec<[f64; 3]>,  // [RA, Dec, Z]
+        radio_grados: f64,
+        min_score: Option<f64>,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        let min_score_val = min_score.unwrap_or(0.3);
+        let mut nodos_validos = Vec::new();
+        let mut resultados_detallados = Vec::new();
+        
+        for (i, centro) in candidatos_centros.iter().enumerate() {
+            let centro_ra = centro[0];
+            let centro_dec = centro[1];
+            let centro_z = centro[2];
+            
+            // Filtrar galaxias cercanas
+            let galaxias_cercanas: Vec<[f64; 4]> = galaxias
+                .iter()
+                .filter(|g| {
+                    distancia_angular(g[0], g[1], centro_ra, centro_dec) < radio_grados * 2.0
+                })
+                .cloned()
+                .collect();
+            
+            if galaxias_cercanas.len() < 20 {
+                continue;
+            }
+            
+            // Analizar hexagonalidad
+            match self.analizar_hexagonal_completo(
+                galaxias_cercanas.clone(),
+                centro_ra,
+                centro_dec,
+                radio_grados,
+                Some(0.5),
+            ) {
+                Ok(resultado) => {
+                    let score = resultado.get("score_hexagonal").unwrap_or(&0.0);
+                    let hexagonal_detectado = resultado.get("hexagonal_detectado").unwrap_or(&0.0);
+                    
+                    if *score >= min_score_val && *hexagonal_detectado > 0.5 {
+                        nodos_validos.push(i);
+                        
+                        resultados_detallados.push(HashMap::from([
+                            ("ra".to_string(), centro_ra),
+                            ("dec".to_string(), centro_dec),
+                            ("z".to_string(), centro_z),
+                            ("score".to_string(), *score),
+                            ("error_rel".to_string(), *resultado.get("error_relativo").unwrap_or(&0.0)),
+                            ("n_vertices".to_string(), *resultado.get("n_vertices").unwrap_or(&0.0)),
+                            ("anillos".to_string(), *resultado.get("anillos_detectados").unwrap_or(&0.0)),
+                        ]));
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        
+        // Preparar resultados
+        let mut resultados = HashMap::new();
+        
+        if !resultados_detallados.is_empty() {
+            let mut ra_vec = Vec::new();
+            let mut dec_vec = Vec::new();
+            let mut z_vec = Vec::new();
+            let mut score_vec = Vec::new();
+            let mut error_vec = Vec::new();
+            let mut vertices_vec = Vec::new();
+            let mut anillos_vec = Vec::new();
+            
+            for res in resultados_detallados {
+                ra_vec.push(*res.get("ra").unwrap());
+                dec_vec.push(*res.get("dec").unwrap());
+                z_vec.push(*res.get("z").unwrap());
+                score_vec.push(*res.get("score").unwrap());
+                error_vec.push(*res.get("error_rel").unwrap());
+                vertices_vec.push(*res.get("n_vertices").unwrap());
+                anillos_vec.push(*res.get("anillos").unwrap());
+            }
+            
+            resultados.insert("ra".to_string(), ra_vec);
+            resultados.insert("dec".to_string(), dec_vec);
+            resultados.insert("z".to_string(), z_vec);
+            resultados.insert("score".to_string(), score_vec);
+            resultados.insert("error_rel".to_string(), error_vec);
+            resultados.insert("n_vertices".to_string(), vertices_vec);
+            resultados.insert("anillos".to_string(), anillos_vec);
+            resultados.insert("n_nodos_detectados".to_string(), vec![nodos_validos.len() as f64]);
+        } else {
+            resultados.insert("n_nodos_detectados".to_string(), vec![0.0]);
+        }
+        
+        Ok(resultados)
+    }
+
+    /// Analizar periodicidad en redshift como en paper de Vallejos (sección II.C)
+    #[pyo3(signature = (redshifts, omega_0_test=None))]
+    fn analizar_periodicidad_redshift(
+        &self,
+        redshifts: Vec<f64>,
+        omega_0_test: Option<f64>,
+    ) -> PyResult<HashMap<String, f64>> {
+        if redshifts.len() < 5 {
+            return Err(PyValueError::new_err("Muy pocos redshifts para análisis"));
+        }
+        
+        let omega_0 = omega_0_test.unwrap_or(self.omega_0);
+        let n = redshifts.len() as f64;
+        
+        // 1. Encontrar offset óptimo
+        let mut mejor_offset = 0.0;
+        let mut mejor_error = f64::MAX;
+        
+        for offset in (0..100).map(|i| i as f64 * 0.001) {
+            let mut error_total = 0.0;
+            for &z in &redshifts {
+                let n_teorico = (z - offset) / omega_0;
+                let n_entero = n_teorico.round();
+                error_total += (n_teorico - n_entero).abs();
+            }
+            
+            if error_total < mejor_error {
+                mejor_error = error_total;
+                mejor_offset = offset;
+            }
+        }
+        
+        // 2. Rayleigh test para periodicidad
+        let fases: Vec<f64> = redshifts
+            .iter()
+            .map(|&z| {
+                let fase = ((z - mejor_offset) / omega_0).fract();
+                2.0 * PI * fase
+            })
+            .collect();
+        
+        let sum_cos: f64 = fases.iter().map(|&phi| phi.cos()).sum();
+        let sum_sin: f64 = fases.iter().map(|&phi| phi.sin()).sum();
+        
+        let r = (sum_cos.powi(2) + sum_sin.powi(2)).sqrt() / n;
+        let p_rayleigh = (-n * r * r).exp();
+        
+        // 3. Calcular errores de ajuste
+        let mut errores_porcentuales = Vec::new();
+        for &z in &redshifts {
+            let n_teorico = (z - mejor_offset) / omega_0;
+            let n_entero = n_teorico.round();
+            let z_teorico = mejor_offset + n_entero * omega_0;
+            let error_pct = ((z - z_teorico).abs() / omega_0) * 100.0;
+            errores_porcentuales.push(error_pct);
+        }
+        
+        let error_promedio = errores_porcentuales.iter().sum::<f64>() / n;
+        
+        // 4. Monte Carlo simulation
+        let n_simulaciones = 10000;
+        let z_min = redshifts.iter().cloned().fold(f64::MAX, f64::min);
+        let z_max = redshifts.iter().cloned().fold(f64::MIN, f64::max);
+        
+        let mut mejor_r_simulado = 0.0;
+        let mut rng = rand::thread_rng();
+        
+        for _ in 0..n_simulaciones {
+            let mut redshifts_sim: Vec<f64> = (0..redshifts.len())
+                .map(|_| rng.gen_range(z_min..z_max))
+                .collect();
+            
+            redshifts_sim.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            
+            let fases_sim: Vec<f64> = redshifts_sim
+                .iter()
+                .map(|&z| {
+                    let fase = ((z - mejor_offset) / omega_0).fract();
+                    2.0 * PI * fase
+                })
+                .collect();
+            
+            let sum_cos_sim: f64 = fases_sim.iter().map(|&phi| phi.cos()).sum();
+            let sum_sin_sim: f64 = fases_sim.iter().map(|&phi| phi.sin()).sum();
+            
+            let r_sim = (sum_cos_sim.powi(2) + sum_sin_sim.powi(2)).sqrt() / n;
+            
+            if r_sim > mejor_r_simulado {
+                mejor_r_simulado = r_sim;
+            }
+        }
+        
+        let p_montecarlo = if mejor_r_simulado > 0.0 {
+            let mut count_mejor = 0;
+            for _ in 0..1000 {
+                let mut redshifts_sim: Vec<f64> = (0..redshifts.len())
+                    .map(|_| rng.gen_range(z_min..z_max))
+                    .collect();
+                
+                redshifts_sim.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                
+                let fases_sim: Vec<f64> = redshifts_sim
+                    .iter()
+                    .map(|&z| {
+                        let fase = ((z - mejor_offset) / omega_0).fract();
+                        2.0 * PI * fase
+                    })
+                    .collect();
+                
+                let sum_cos_sim: f64 = fases_sim.iter().map(|&phi| phi.cos()).sum();
+                let sum_sin_sim: f64 = fases_sim.iter().map(|&phi| phi.sin()).sum();
+                
+                let r_sim = (sum_cos_sim.powi(2) + sum_sin_sim.powi(2)).sqrt() / n;
+                
+                if r_sim >= r {
+                    count_mejor += 1;
+                }
+            }
+            count_mejor as f64 / 1000.0
+        } else {
+            1.0
+        };
+        
+        // 5. Preparar resultados
+        let mut resultados = HashMap::new();
+        resultados.insert("omega_0".to_string(), omega_0);
+        resultados.insert("offset_optimo".to_string(), mejor_offset);
+        resultados.insert("error_promedio_pct".to_string(), error_promedio);
+        resultados.insert("r_statistic".to_string(), r);
+        resultados.insert("p_rayleigh".to_string(), p_rayleigh);
+        resultados.insert("p_montecarlo".to_string(), p_montecarlo);
+        resultados.insert("n_redshifts".to_string(), n);
+        resultados.insert("significativo".to_string(), 
+            if p_rayleigh < 0.001 && p_montecarlo < 0.01 { 1.0 } else { 0.0 });
+        
+        Ok(resultados)
+    }
+
+    // ==============================================
+    // 3. MÉTODOS EXISTENTES DE LA VERSIÓN ANTERIOR
+    // ==============================================
+
+    fn calcular_conectividad(
+        &self,
+        nodos_confirmados: Vec<[f64; 3]>,
+        radio_esperado_grados: f64
+    ) -> PyResult<Vec<(usize, usize, f64)>> {
+        let d_teorica = 3.0f64.sqrt() * radio_esperado_grados;
+        let tolerancia = 0.25 * d_teorica;
+
+        let conexiones: Vec<(usize, usize, f64)> = nodos_confirmados
+            .par_iter()
+            .enumerate()
+            .flat_map(|(i, nodo_a)| {
+                let mut locales = Vec::new();
+                for j in (i + 1)..nodos_confirmados.len() {
+                    let nodo_b = &nodos_confirmados[j];
+                    let dist = distancia_angular(nodo_a[0], nodo_a[1], nodo_b[0], nodo_b[1]);
+
+                    if (dist - d_teorica).abs() < tolerancia {
+                        locales.push((i, j, dist));
+                    }
+                }
+                locales
+            })
+            .collect();
+
+        Ok(conexiones)
+    }
+
+    fn stacking_masivo(
+        &self,
+        galaxias: Vec<[f64; 5]>,
+        vacios: Vec<[f64; 3]>,
+        _cosmo_h0: f64,
+        _cosmo_om0: f64,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        if galaxias.is_empty() || vacios.is_empty() {
+            return Err(PyValueError::new_err("Datos vacíos"));
+        }
+
+        let resultados: Vec<(usize, Vec<f64>)> = vacios
+            .par_iter()
+            .enumerate()
+            .map(|(idx_vacio, centro)| {
+                let mut vdisp_vacio = Vec::new();
+                let r_limit = self.search_radius_mpc / 100.0;
+                for gal in &galaxias {
+                    let dx = gal[0] - centro[0];
+                    let dy = gal[1] - centro[1];
+                    if (dx*dx + dy*dy).sqrt() < r_limit {
+                        vdisp_vacio.push(gal[3]);
+                    }
+                }
+                let mut stats = Vec::new();
+                if !vdisp_vacio.is_empty() {
+                    stats.push(vdisp_vacio.iter().sum::<f64>() / vdisp_vacio.len() as f64);
+                    stats.push(vdisp_vacio.len() as f64);
+                }
+                (idx_vacio, stats)
+            })
+            .collect();
+
+        let mut output = HashMap::new();
+        let mut mean_vdisp = Vec::new();
+        let mut counts = Vec::new();
+        let mut all_stacked = Vec::new();
+
+        for (idx, stats) in resultados {
+            if !stats.is_empty() {
+                mean_vdisp.push(stats[0]);
+                counts.push(stats[1]);
+                if let Some(c) = vacios.get(idx) {
+                    for g in &galaxias {
+                        if ((g[0]-c[0]).powi(2) + (g[1]-c[1]).powi(2)).sqrt() < self.search_radius_mpc / 100.0 {
+                            all_stacked.push(g[3]);
+                        }
+                    }
+                }
+            }
+        }
+
+        output.insert("all_vdisp_stacked".to_string(), all_stacked);
+        output.insert("mean_vdisp_per_void".to_string(), mean_vdisp);
+        output.insert("n_galaxies_per_void".to_string(), counts);
+        Ok(output)
+    }
+
+    fn analizar_anisotropia_hexagonal(
+        &self,
+        galaxias: Vec<[f64; 5]>,
+        centro: [f64; 3],
+        radio_anillo: f64,
+        ancho_anillo: f64,
+    ) -> PyResult<HashMap<String, f64>> {
+        let r_min = radio_anillo - ancho_anillo / 2.0;
+        let r_max = radio_anillo + ancho_anillo / 2.0;
+        let mut angulos = Vec::new();
+
+        for gal in &galaxias {
+            let dx = gal[0] - centro[0];
+            let dy = gal[1] - centro[1];
+            let dist = (dx*dx + dy*dy).sqrt();
+            if dist >= r_min && dist <= r_max {
+                angulos.push(dy.atan2(dx));
+            }
+        }
+
+        if angulos.len() < 10 {
+            return Err(PyRuntimeError::new_err("Baja densidad galáctica"));
+        }
+
+        let n = angulos.len() as f64;
+        let sum_cos = angulos.iter().map(|a| a.cos()).sum::<f64>();
+        let sum_sin = angulos.iter().map(|a| a.sin()).sum::<f64>();
+        let p_rayleigh = (-(sum_cos.powi(2) + sum_sin.powi(2)) / n).exp();
+
+        let mut hist = [0.0; 6];
+        for a in angulos {
+            let bin = (((a.to_degrees() + 360.0) % 60.0) / 10.0).floor() as usize;
+            if bin < 6 { hist[bin] += 1.0; }
+        }
+        let expected = n / 6.0;
+        let chi2 = hist.iter().map(|&c| (c - expected).powi(2) / expected).sum();
+
+        let mut res = HashMap::new();
+        res.insert("n_galaxias".to_string(), n);
+        res.insert("p_rayleigh".to_string(), p_rayleigh);
+        res.insert("chi2_hex".to_string(), chi2);
+        Ok(res)
+    }
+
+    fn analizar_densidad_empaquetamiento(
+        &self,
+        nodos: Vec<[f64; 3]>, // [RA, Dec, Z]
+        h0: f64,
+        _omega_m: f64
+    ) -> PyResult<HashMap<String, f64>> {
+        let c = C_LIGHT;
+        let n = nodos.len() as f64;
+
+        // 1. Calcular Distancias Comóviles (Mpc) usando integración simple
+        let distancias_comoviles: Vec<f64> = nodos.par_iter().map(|nodo| {
+            let z = nodo[2];
+            (c / h0) * (1.0 + z).ln()
+        }).collect();
+
+        // 2. Calcular Separación Media (Vecino más cercano)
+        let suma_distancias: f64 = nodos.par_iter().enumerate().map(|(i, nodo_a)| {
+            let mut min_dist = f64::MAX;
+            for (j, nodo_b) in nodos.iter().enumerate() {
+                if i == j { continue; }
+                let d_angular = distancia_angular(nodo_a[0], nodo_a[1], nodo_b[0], nodo_b[1]);
+                let dist_mpc = distancias_comoviles[i] * d_angular.to_radians();
+                if dist_mpc < min_dist { min_dist = dist_mpc; }
+            }
+            min_dist
+        }).sum();
+
+        let separacion_media = suma_distancias / n;
+        let z_medio = nodos.iter().map(|n| n[2]).sum::<f64>() / n;
+
+        let mut res = HashMap::new();
+        res.insert("separacion_mpc".to_string(), separacion_media);
+        res.insert("z_medio".to_string(), z_medio);
+        res.insert("n_nodos".to_string(), n);
+
+        Ok(res)
+    }
+
+    // ==============================================
+    // 4. ANÁLISIS DE PERIODICIDAD ESPACIAL - FUNCIONES NUEVAS DE V1
+    // ==============================================
+
+    /// ANÁLISIS FOURIER: Buscar periodicidades mediante espectro de potencia
+    #[pyo3(signature = (distancias_mpc, max_periodo = 5000.0, n_bins = 1000))]
+    fn analisis_fourier_periodicidad(
+        &self,
+        distancias_mpc: Vec<f64>,
+        max_periodo: f64,
+        n_bins: usize,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        if distancias_mpc.len() < 100 {
+            return Err(PyValueError::new_err("Muy pocas distancias para análisis Fourier"));
+        }
+
+        // Crear histograma
+        let bin_width = max_periodo / n_bins as f64;
+        let mut hist = vec![0.0; n_bins];
+
+        for &dist in &distancias_mpc {
+            if dist <= max_periodo {
+                let bin_idx = (dist / bin_width).floor() as usize;
+                if bin_idx < n_bins {
+                    hist[bin_idx] += 1.0;
+                }
+            }
+        }
+
+        // Aplicar ventana de Hanning
+        let window: Vec<f64> = (0..n_bins)
+            .map(|i| {
+                0.5 * (1.0 - (2.0 * PI * i as f64 / (n_bins as f64 - 1.0)).cos())
+            })
+            .collect();
+
+        let hist_windowed: Vec<f64> = hist
+            .iter()
+            .zip(window.iter())
+            .map(|(&h, &w)| h * w)
+            .collect();
+
+        // DFT simple
+        let mut power_spectrum = vec![0.0; n_bins / 2];
+        let mut freqs = vec![0.0; n_bins / 2];
+
+        for k in 0..n_bins / 2 {
+            let mut sum_real = 0.0;
+            let mut sum_imag = 0.0;
+
+            for n in 0..n_bins {
+                let angle = -2.0 * PI * k as f64 * n as f64 / n_bins as f64;
+                sum_real += hist_windowed[n] * angle.cos();
+                sum_imag += hist_windowed[n] * angle.sin();
+            }
+
+            power_spectrum[k] = (sum_real.powi(2) + sum_imag.powi(2)).sqrt();
+            freqs[k] = k as f64 / (n_bins as f64 * bin_width);
+        }
+
+        // Encontrar picos significativos
+        let mut picos = Vec::new();
+        let umbral = power_spectrum.iter().cloned().fold(0.0, f64::max) * 0.1;
+
+        for k in 1..power_spectrum.len() - 1 {
+            if power_spectrum[k] > power_spectrum[k - 1]
+                && power_spectrum[k] > power_spectrum[k + 1]
+                && power_spectrum[k] > umbral
+            {
+                if freqs[k] > 0.0 {
+                    let periodo = 1.0 / freqs[k];
+                    if periodo > 100.0 && periodo < max_periodo {
+                        picos.push((periodo, power_spectrum[k]));
+                    }
+                }
+            }
+        }
+
+        // Ordenar picos por potencia
+        picos.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Preparar resultados
+        let mut resultados = HashMap::new();
+
+        let periodos: Vec<f64> = picos.iter().map(|&(p, _)| p).collect();
+        let potencias: Vec<f64> = picos.iter().map(|&(_, power)| power).collect();
+
+        resultados.insert("periodos_mpc".to_string(), periodos);
+        resultados.insert("potencias".to_string(), potencias);
+        resultados.insert("frecuencias".to_string(), freqs);
+        resultados.insert("power_spectrum".to_string(), power_spectrum);
+        resultados.insert("n_distancias".to_string(), vec![distancias_mpc.len() as f64]);
+        resultados.insert("max_periodo".to_string(), vec![max_periodo]);
+
+        Ok(resultados)
+    }
+
+    // ==============================================
+    // 5. FUNCIONES EXISTENTES DE PERIODICIDAD ESPACIAL
+    // ==============================================
+
+    #[pyo3(signature = (estructuras, escalas_analizar = None, ventana_relativa = 0.05, h0 = 70.0))]
+    fn analizar_periodicidad_espacial(
+        &self,
+        estructuras: Vec<[f64; 3]>,  // [RA, Dec, Z]
+        escalas_analizar: Option<Vec<f64>>,
+        ventana_relativa: f64,
+        h0: f64,
+    ) -> PyResult<HashMap<String, f64>> {
+        let n = estructuras.len();
+        if n < 10 {
+            return Err(PyValueError::new_err("Muy pocas estructuras para análisis"));
+        }
+
+        // Escalas predeterminadas (820 Mpc y múltiplos)
+        let escalas = escalas_analizar.unwrap_or_else(|| {
+            vec![
+                205.0,   // Cuarto
+                410.0,   // Mitad
+                615.0,   // 0.75×
+                820.0,   // Base
+                841.0,   // Vallejos
+                1025.0,  // 1.25×
+                1230.0,  // 1.5×
+                1435.0,  // 1.75×
+                1640.0,  // Doble
+                2460.0,  // Triple
+                3280.0,  // Cuádruple
+                4100.0,  // Quíntuple
+            ]
+        });
+
+        // Calcular todas las distancias
+        let mut distancias = Vec::new();
+
+        for i in 0..n {
+            let estr1 = &estructuras[i];
+            for j in (i + 1)..n {
+                let estr2 = &estructuras[j];
+
+                let dist_angular = distancia_angular(estr1[0], estr1[1], estr2[0], estr2[1]);
+                let z_medio = (estr1[2] + estr2[2]) / 2.0;
+                let d_comov = distancia_comovil(z_medio, h0);
+                let dist_mpc = d_comov * dist_angular.to_radians();
+
+                if dist_mpc.is_finite() {
+                    distancias.push(dist_mpc);
+                }
+            }
+        }
+
+        let n_distancias = distancias.len() as f64;
+        let dist_max = distancias.iter().cloned().fold(0.0, f64::max);
+
+        if dist_max <= 0.0 {
+            return Err(PyValueError::new_err("Distancias inválidas"));
+        }
+
+        // Analizar cada escala
+        let mut resultados = HashMap::new();
+        resultados.insert("n_estructuras".to_string(), n as f64);
+        resultados.insert("n_distancias".to_string(), n_distancias);
+        resultados.insert("dist_max".to_string(), dist_max);
+        resultados.insert("dist_min".to_string(), distancias.iter().cloned().fold(f64::MAX, f64::min));
+
+        for (idx, &escala) in escalas.iter().enumerate() {
+            if escala > dist_max * 1.1 {
+                continue; // Escala fuera de rango
+            }
+
+            let ventana = escala * ventana_relativa;
+            let mut count = 0;
+
+            for &dist in &distancias {
+                if (dist - escala).abs() < ventana {
+                    count += 1;
+                }
+            }
+
+            // Estadística de fondo
+            let bin_width = ventana * 2.0;
+            let n_bins = dist_max / bin_width;
+            let esperado = n_distancias / n_bins;
+
+            // Significancia (sigma)
+            let sigma = if esperado > 0.0 {
+                (count as f64 - esperado) / esperado.sqrt()
+            } else {
+                0.0
+            };
+
+            let ratio = if esperado > 0.0 {
+                count as f64 / esperado
+            } else {
+                0.0
+            };
+
+            // p-value aproximado usando nuestra función erf
+            let p_value = 2.0 * (1.0 - 0.5 * (1.0 + erf_approx(sigma.abs() / 2.0_f64.sqrt())));
+
+            resultados.insert(format!("escala_{}_mpc", idx), escala);
+            resultados.insert(format!("observado_{}", idx), count as f64);
+            resultados.insert(format!("esperado_{}", idx), esperado);
+            resultados.insert(format!("sigma_{}", idx), sigma);
+            resultados.insert(format!("ratio_{}", idx), ratio);
+            resultados.insert(format!("p_value_{}", idx), p_value);
+            resultados.insert(format!("significativo_{}", idx),
+                if sigma > 3.0 { 1.0 } else { 0.0 });
+        }
+
+        // Estadísticas adicionales
+        let mean = distancias.iter().sum::<f64>() / n_distancias;
+        let variance: f64 = distancias.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / n_distancias;
+        resultados.insert("mean_dist".to_string(), mean);
+        resultados.insert("variance_dist".to_string(), variance);
+        resultados.insert("std_dist".to_string(), variance.sqrt());
+
+        Ok(resultados)
+    }
+
+    #[pyo3(signature = (galaxias, z_min = 0.1, z_max = 0.6, umbral_densidad = 0.9, grid_ra = 50, grid_dec = 50, grid_z = 20))]
+    fn identificar_super_estructuras(
+        &self,
+        galaxias: Vec<[f64; 4]>,  // [RA, Dec, Z, VDISP]
+        z_min: f64,
+        z_max: f64,
+        umbral_densidad: f64,
+        grid_ra: usize,
+        grid_dec: usize,
+        grid_z: usize,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        // Filtrar por redshift
+        let galaxias_filtradas: Vec<[f64; 4]> = galaxias
+            .into_iter()
+            .filter(|g| g[2] >= z_min && g[2] <= z_max)
+            .collect();
+
+        if galaxias_filtradas.len() < 100 {
+            return Err(PyValueError::new_err("Muy pocas galaxias después del filtro"));
+        }
+
+        // Encontrar rangos
+        let (ra_min, ra_max) = galaxias_filtradas.iter().fold(
+            (f64::MAX, f64::MIN),
+            |(min, max), g| (min.min(g[0]), max.max(g[0]))
+        );
+
+        let (dec_min, dec_max) = galaxias_filtradas.iter().fold(
+            (f64::MAX, f64::MIN),
+            |(min, max), g| (min.min(g[1]), max.max(g[1]))
+        );
+
+        // Histograma 3D
+        let mut hist = vec![vec![vec![0.0; grid_z]; grid_dec]; grid_ra];
+
+        for gal in &galaxias_filtradas {
+            let ra = gal[0];
+            let dec = gal[1];
+            let z = gal[2];
+
+            let i_ra = ((ra - ra_min) / (ra_max - ra_min) * (grid_ra - 1) as f64)
+                .floor().clamp(0.0, (grid_ra - 1) as f64) as usize;
+            let i_dec = ((dec - dec_min) / (dec_max - dec_min) * (grid_dec - 1) as f64)
+                .floor().clamp(0.0, (grid_dec - 1) as f64) as usize;
+            let i_z = ((z - z_min) / (z_max - z_min) * (grid_z - 1) as f64)
+                .floor().clamp(0.0, (grid_z - 1) as f64) as usize;
+
+            hist[i_ra][i_dec][i_z] += 1.0;
+        }
+
+        // Aplanar histograma para encontrar percentil
+        let mut valores = Vec::new();
+        for i in 0..grid_ra {
+            for j in 0..grid_dec {
+                for k in 0..grid_z {
+                    if hist[i][j][k] > 0.0 {
+                        valores.push(hist[i][j][k]);
+                    }
+                }
+            }
+        }
+
+        valores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx_umbral = (valores.len() as f64 * umbral_densidad).floor() as usize;
+        let umbral = if idx_umbral < valores.len() {
+            valores[idx_umbral]
+        } else {
+            0.0
+        };
+
+        // Identificar centros de estructuras
+        let mut centros_ra = Vec::new();
+        let mut centros_dec = Vec::new();
+        let mut centros_z = Vec::new();
+        let mut densidades = Vec::new();
+
+        for i in 0..grid_ra {
+            for j in 0..grid_dec {
+                for k in 0..grid_z {
+                    if hist[i][j][k] >= umbral {
+                        // Convertir índices a coordenadas
+                        let ra = ra_min + (i as f64 + 0.5) * (ra_max - ra_min) / grid_ra as f64;
+                        let dec = dec_min + (j as f64 + 0.5) * (dec_max - dec_min) / grid_dec as f64;
+                        let z = z_min + (k as f64 + 0.5) * (z_max - z_min) / grid_z as f64;
+
+                        centros_ra.push(ra);
+                        centros_dec.push(dec);
+                        centros_z.push(z);
+                        densidades.push(hist[i][j][k]);
+                    }
+                }
+            }
+        }
+
+        let n_estructuras = centros_ra.len();
+
+        // Resultados
+        let mut resultados = HashMap::new();
+        resultados.insert("ra".to_string(), centros_ra);
+        resultados.insert("dec".to_string(), centros_dec);
+        resultados.insert("z".to_string(), centros_z);
+        resultados.insert("densidad".to_string(), densidades);
+        resultados.insert("n_estructuras".to_string(), vec![n_estructuras as f64]);
+        resultados.insert("umbral_densidad".to_string(), vec![umbral]);
+        resultados.insert("n_galaxias_filtradas".to_string(), vec![galaxias_filtradas.len() as f64]);
+
+        Ok(resultados)
+    }
+
+    #[pyo3(signature = (estructuras, escala_base = 820.0, h0 = 70.0))]
+    fn analizar_red_cristalina(
+        &self,
+        estructuras: Vec<[f64; 3]>,
+        escala_base: f64,
+        h0: f64,
+    ) -> PyResult<HashMap<String, f64>> {
+        let n = estructuras.len();
+        if n < 50 {
+            return Err(PyValueError::new_err("Muy pocas estructuras para análisis de red"));
+        }
+
+        // Convertir a coordenadas cartesianas aproximadas
+        let mut coordenadas_x = Vec::with_capacity(n);
+        let mut coordenadas_y = Vec::with_capacity(n);
+        let mut coordenadas_z = Vec::with_capacity(n);
+
+        for estr in &estructuras {
+            let d_comov = distancia_comovil(estr[2], h0);
+            let ra_rad = estr[0].to_radians();
+            let dec_rad = estr[1].to_radians();
+
+            let x = d_comov * dec_rad.cos() * ra_rad.cos();
+            let y = d_comov * dec_rad.cos() * ra_rad.sin();
+            let z = d_comov * dec_rad.sin();
+
+            coordenadas_x.push(x);
+            coordenadas_y.push(y);
+            coordenadas_z.push(z);
+        }
+
+        // Función para analizar periodicidad en un eje
+        fn analizar_eje(coords: &[f64], escala_base: f64) -> (bool, usize, f64) {
+            let n_bins = 100;
+            let min = coords.iter().cloned().fold(f64::MAX, f64::min);
+            let max = coords.iter().cloned().fold(f64::MIN, f64::max);
+            let range = max - min;
+
+            if range <= 0.0 {
+                return (false, 0, 0.0);
+            }
+
+            let bin_width = range / n_bins as f64;
+
+            // Histograma
+            let mut hist = vec![0.0; n_bins];
+            for &coord in coords {
+                let bin_idx = ((coord - min) / bin_width).floor() as usize;
+                if bin_idx < n_bins {
+                    hist[bin_idx] += 1.0;
+                }
+            }
+
+            // Autocorrelación simple
+            let max_lag = 50.min(n_bins / 2);
+            let mut autocorr = vec![0.0; max_lag];
+
+            for lag in 0..max_lag {
+                let mut sum = 0.0;
+                let mut count = 0;
+                for i in 0..(n_bins - lag) {
+                    sum += hist[i] * hist[i + lag];
+                    count += 1;
+                }
+                if count > 0 {
+                    autocorr[lag] = sum / count as f64;
+                }
+            }
+
+            // Encontrar picos
+            let mut picos_cercanos = 0;
+            let mut mejor_pico = 0.0;
+
+            for lag in 1..autocorr.len() - 1 {
+                if autocorr[lag] > autocorr[lag - 1] && autocorr[lag] > autocorr[lag + 1] {
+                    let distancia_pico = lag as f64 * bin_width;
+                    if (distancia_pico - escala_base).abs() / escala_base < 0.1 {
+                        picos_cercanos += 1;
+                        mejor_pico = distancia_pico;
+                    }
+                }
+            }
+
+            (picos_cercanos > 0, picos_cercanos, mejor_pico)
+        }
+
+        let (periodicidad_x, picos_x, mejor_x) = analizar_eje(&coordenadas_x, escala_base);
+        let (periodicidad_y, picos_y, mejor_y) = analizar_eje(&coordenadas_y, escala_base);
+        let (periodicidad_z, picos_z, mejor_z) = analizar_eje(&coordenadas_z, escala_base);
+
+        let mut resultados = HashMap::new();
+
+        resultados.insert("periodicidad_x".to_string(), if periodicidad_x { 1.0 } else { 0.0 });
+        resultados.insert("periodicidad_y".to_string(), if periodicidad_y { 1.0 } else { 0.0 });
+        resultados.insert("periodicidad_z".to_string(), if periodicidad_z { 1.0 } else { 0.0 });
+
+        resultados.insert("n_picos_x".to_string(), picos_x as f64);
+        resultados.insert("n_picos_y".to_string(), picos_y as f64);
+        resultados.insert("n_picos_z".to_string(), picos_z as f64);
+
+        resultados.insert("mejor_pico_x".to_string(), mejor_x);
+        resultados.insert("mejor_pico_y".to_string(), mejor_y);
+        resultados.insert("mejor_pico_z".to_string(), mejor_z);
+
+        // Promedio de picos cercanos
+        let picos_totales = picos_x + picos_y + picos_z;
+        let mejores_picos = [mejor_x, mejor_y, mejor_z];
+        let picos_validos: Vec<f64> = mejores_picos.iter().filter(|&&p| p > 0.0).cloned().collect();
+
+        let promedio_picos = if !picos_validos.is_empty() {
+            picos_validos.iter().sum::<f64>() / picos_validos.len() as f64
+        } else {
+            0.0
+        };
+
+        resultados.insert("promedio_picos_cercanos".to_string(), promedio_picos);
+        resultados.insert("n_picos_totales".to_string(), picos_totales as f64);
+        resultados.insert("escala_base".to_string(), escala_base);
+
+        // Coincidencia con escala base
+        let coincidencia = if promedio_picos > 0.0 {
+            (promedio_picos - escala_base).abs() / escala_base
+        } else {
+            1.0
+        };
+
+        resultados.insert("coincidencia_escala".to_string(), coincidencia);
+        resultados.insert("coincidencia_ok".to_string(), if coincidencia < 0.1 { 1.0 } else { 0.0 });
+
+        Ok(resultados)
+    }
+
+    #[pyo3(signature = (estructuras, escala_test = 820.0, ventana_relativa = 0.05, n_permutaciones = 1000, h0 = 70.0))]
+    fn test_significancia_permutaciones(
+        &self,
+        estructuras: Vec<[f64; 3]>,
+        escala_test: f64,
+        ventana_relativa: f64,
+        n_permutaciones: usize,
+        h0: f64,
+    ) -> PyResult<HashMap<String, f64>> {
+        let n = estructuras.len();
+        if n < 20 {
+            return Err(PyValueError::new_err("Muy pocas estructuras para test de permutaciones"));
+        }
+
+        // Calcular distancias observadas
+        let mut distancias = Vec::new();
+        let ventana = escala_test * ventana_relativa;
+
+        for i in 0..n {
+            let estr1 = &estructuras[i];
+            for j in (i + 1)..n {
+                let estr2 = &estructuras[j];
+
+                let dist_angular = distancia_angular(estr1[0], estr1[1], estr2[0], estr2[1]);
+                let z_medio = (estr1[2] + estr2[2]) / 2.0;
+                let d_comov = distancia_comovil(z_medio, h0);
+                let dist_mpc = d_comov * dist_angular.to_radians();
+
+                distancias.push(dist_mpc);
+            }
+        }
+
+        // Contar observado
+        let observado = distancias.iter()
+            .filter(|&&d| (d - escala_test).abs() < ventana)
+            .count();
+
+        // Generar permutaciones aleatorias
+        let mut rng = rand::thread_rng();
+        let mut permutaciones_superiores = 0;
+
+        for _ in 0..n_permutaciones {
+            // Permutar redshifts (mantener posiciones)
+            let mut estructuras_perm = estructuras.clone();
+            for i in 0..n {
+                let j = rng.gen_range(0..n);
+                estructuras_perm[i][2] = estructuras[j][2];
+            }
+
+            // Calcular distancias permutadas
+            let mut count_perm = 0;
+            for i in 0..n {
+                let estr1 = &estructuras_perm[i];
+                for j in (i + 1)..n {
+                    let estr2 = &estructuras_perm[j];
+
+                    let dist_angular = distancia_angular(estr1[0], estr1[1], estr2[0], estr2[1]);
+                    let z_medio = (estr1[2] + estr2[2]) / 2.0;
+                    let d_comov = distancia_comovil(z_medio, h0);
+                    let dist_mpc = d_comov * dist_angular.to_radians();
+
+                    if (dist_mpc - escala_test).abs() < ventana {
+                        count_perm += 1;
+                    }
+                }
+            }
+
+            if count_perm >= observado {
+                permutaciones_superiores += 1;
+            }
+        }
+
+        // Calcular p-value
+        let p_value = permutaciones_superiores as f64 / n_permutaciones as f64;
+
+        // Estadística Z
+        let n_pares = n * (n - 1) / 2;
+        let prob_esperada = (2.0 * ventana) / (escala_test * 10.0); // Estimación
+        let esperado = n_pares as f64 * prob_esperada;
+        let sigma = if esperado > 0.0 {
+            (observado as f64 - esperado) / esperado.sqrt()
+        } else {
+            0.0
+        };
+
+        let mut resultados = HashMap::new();
+        resultados.insert("observado".to_string(), observado as f64);
+        resultados.insert("esperado".to_string(), esperado);
+        resultados.insert("sigma".to_string(), sigma);
+        resultados.insert("p_value_perm".to_string(), p_value);
+        resultados.insert("n_permutaciones".to_string(), n_permutaciones as f64);
+        resultados.insert("significativo".to_string(), if p_value < 0.05 { 1.0 } else { 0.0 });
+        resultados.insert("escala_test_mpc".to_string(), escala_test);
+        resultados.insert("ventana_mpc".to_string(), ventana);
+
+        Ok(resultados)
+    }
+
+    // ==============================================
+    // 6. MÉTODOS DE INCLUSIÓN JERÁRQUICA (simplificados)
+    // ==============================================
+
+    fn analizar_inclusion_jerarquica(
+        &self,
+        micro_nodos: Vec<[f64; 3]>,
+        macro_nodos: Vec<[f64; 3]>,
+        radio_inclusion_mpc: f64,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        let mut resultados = HashMap::new();
+        resultados.insert("n_micro".to_string(), vec![micro_nodos.len() as f64]);
+        resultados.insert("n_macro".to_string(), vec![macro_nodos.len() as f64]);
+        resultados.insert("radio_inclusion".to_string(), vec![radio_inclusion_mpc]);
+        Ok(resultados)
+    }
+
+    fn calcular_masa_efectiva_vacios(
+        &self,
+        micro_nodos: Vec<[f64; 3]>,
+        macro_centros: Vec<[f64; 3]>,
+        radio_void_mpc: f64,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        let mut resultados = HashMap::new();
+        resultados.insert("n_micro".to_string(), vec![micro_nodos.len() as f64]);
+        resultados.insert("n_macro".to_string(), vec![macro_centros.len() as f64]);
+        resultados.insert("radio_void".to_string(), vec![radio_void_mpc]);
+        Ok(resultados)
+    }
+
+    fn mapear_presion_inflacionaria(
+        &self,
+        micro_nodos: Vec<[f64; 3]>,
+        macro_centros: Vec<[f64; 3]>,
+        escala_mpc: f64,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        let mut resultados = HashMap::new();
+        resultados.insert("n_micro".to_string(), vec![micro_nodos.len() as f64]);
+        resultados.insert("n_macro".to_string(), vec![macro_centros.len() as f64]);
+        resultados.insert("escala_mpc".to_string(), vec![escala_mpc]);
+        Ok(resultados)
+    }
+
+    fn analizar_colapso_jerarquico(
+        &self,
+        micro_nodos: Vec<[f64; 3]>,
+        macro_centros: Vec<[f64; 3]>,
+    ) -> PyResult<HashMap<String, f64>> {
+        let mut resultados = HashMap::new();
+        resultados.insert("n_micro".to_string(), micro_nodos.len() as f64);
+        resultados.insert("n_macro".to_string(), macro_centros.len() as f64);
+        Ok(resultados)
+    }
+
+    // ==============================================
+    // 7. NUEVO: FUNCIÓN PARA ANALIZAR COMPLETAMENTE COMO VALLEJOS
+    // ==============================================
+
+    #[pyo3(signature = (galaxias, redshift_range = (0.05, 0.7), radio_celda_mpc = 410.0, h0 = 70.0))]
+    fn analisis_completo_vallejos(
+        &self,
+        galaxias: Vec<[f64; 4]>,  // [RA, Dec, Z, VDISP]
+        redshift_range: Option<(f64, f64)>,
+        radio_celda_mpc: Option<f64>,
+        h0: Option<f64>,
+    ) -> PyResult<HashMap<String, f64>> {
+        let (z_min, z_max) = redshift_range.unwrap_or((0.05, 0.7));
+        let radio_celda = radio_celda_mpc.unwrap_or(410.0);
+        let h0_val = h0.unwrap_or(70.0);
+        
+        // 1. Filtrar por redshift
+        let galaxias_filtradas: Vec<[f64; 4]> = galaxias
+            .into_iter()
+            .filter(|g| g[2] >= z_min && g[2] <= z_max)
+            .collect();
+        
+        if galaxias_filtradas.len() < 1000 {
+            return Err(PyValueError::new_err("Muy pocas galaxias después del filtro"));
+        }
+        
+        // 2. Identificar centros candidatos (vacíos con baja vdisp)
+        let mut vdisp_values: Vec<f64> = galaxias_filtradas.iter().map(|g| g[3]).collect();
+        vdisp_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let umbral_vacio = vdisp_values[(vdisp_values.len() as f64 * 0.25) as usize];
+        
+        let centros_candidatos: Vec<[f64; 3]> = galaxias_filtradas
+            .iter()
+            .filter(|g| g[3] < umbral_vacio)
+            .map(|g| [g[0], g[1], g[2]])
+            .collect();
+        
+        // 3. Convertir radio celda de Mpc a grados
+        let z_medio = galaxias_filtradas.iter().map(|g| g[2]).sum::<f64>() / galaxias_filtradas.len() as f64;
+        let d_comov = distancia_comovil(z_medio, h0_val);
+        let radio_grados = (radio_celda / d_comov).to_degrees();
+        
+        // 4. Detectar nodos hexagonales
+        let nodos_result = self.detectar_nodos_hexagonales(
+            galaxias_filtradas.clone(),
+            centros_candidatos,
+            radio_grados,
+            Some(0.25),
+        )?;
+        
+        let n_nodos = nodos_result.get("n_nodos_detectados")
+            .and_then(|v| v.first())
+            .cloned()
+            .unwrap_or(0.0);
+        
+        // 5. Analizar periodicidad en redshift de los nodos
+        let mut redshift_periodicidad = HashMap::new();
+        if n_nodos > 0.0 {
+            if let Some(z_vec) = nodos_result.get("z") {
+                let redshifts: Vec<f64> = z_vec.clone();
+                redshift_periodicidad = self.analizar_periodicidad_redshift(redshifts, Some(self.omega_0))?;
+            }
+        }
+        
+        // 6. Analizar periodicidad espacial
+        let mut spatial_periodicidad = HashMap::new();
+        if n_nodos > 0.0 {
+            if let (Some(ra_vec), Some(dec_vec), Some(z_vec)) = (
+                nodos_result.get("ra"),
+                nodos_result.get("dec"),
+                nodos_result.get("z"),
+            ) {
+                let estructuras: Vec<[f64; 3]> = ra_vec.iter()
+                    .zip(dec_vec.iter())
+                    .zip(z_vec.iter())
+                    .map(|((&ra, &dec), &z)| [ra, dec, z])
+                    .collect();
+                
+                spatial_periodicidad = self.analizar_periodicidad_espacial(
+                    estructuras,
+                    Some(vec![radio_celda, radio_celda*2.0, radio_celda*3.0]),
+                    0.05,
+                    h0_val,
+                )?;
+            }
+        }
+        
+        // 7. Preparar resultados finales
+        let mut resultados = HashMap::new();
+        
+        // Datos básicos
+        resultados.insert("n_galaxias_total".to_string(), galaxias_filtradas.len() as f64);
+        resultados.insert("z_medio".to_string(), z_medio);
+        resultados.insert("radio_celda_mpc".to_string(), radio_celda);
+        resultados.insert("radio_grados".to_string(), radio_grados);
+        resultados.insert("n_nodos_hexagonales".to_string(), n_nodos);
+        
+        // Resultados de análisis hexagonal
+        if let Some(scores) = nodos_result.get("score") {
+            if !scores.is_empty() {
+                let avg_score: f64 = scores.iter().sum::<f64>() / scores.len() as f64;
+                resultados.insert("score_hexagonal_promedio".to_string(), avg_score);
+            }
+        }
+        
+        if let Some(errors) = nodos_result.get("error_rel") {
+            if !errors.is_empty() {
+                let avg_error: f64 = errors.iter().sum::<f64>() / errors.len() as f64;
+                resultados.insert("error_hexagonal_promedio".to_string(), avg_error);
+                resultados.insert("hexagonal_detectado".to_string(), 
+                    if avg_error < self.umbral_hexagonal_error / 100.0 { 1.0 } else { 0.0 });
+            }
+        }
+        
+        // Resultados de periodicidad en redshift
+        for (key, value) in redshift_periodicidad {
+            resultados.insert(format!("redshift_{}", key), value);
+        }
+        
+        // Resultados de periodicidad espacial
+        for (key, value) in spatial_periodicidad {
+            if key.starts_with("sigma_") || key.starts_with("ratio_") || key.starts_with("p_value_") {
+                resultados.insert(format!("spatial_{}", key), value);
+            }
+        }
+        
+        // Diagnóstico final
+        let mut criterios_cumplidos = 0;
+        
+        if n_nodos >= 5.0 {
+            criterios_cumplidos += 1;
+        }
+        
+        if let Some(&score) = resultados.get("score_hexagonal_promedio") {
+            if score >= 0.3 {
+                criterios_cumplidos += 1;
+            }
+        }
+        
+        if let Some(&error) = resultados.get("error_hexagonal_promedio") {
+            if error < 0.25 {
+                criterios_cumplidos += 1;
+            }
+        }
+        
+        if let Some(&p_rayleigh) = resultados.get("redshift_p_rayleigh") {
+            if p_rayleigh < 0.001 {
+                criterios_cumplidos += 1;
+            }
+        }
+        
+        resultados.insert("criterios_cumplidos".to_string(), criterios_cumplidos as f64);
+        resultados.insert("diagnostico".to_string(),
+            if criterios_cumplidos >= 3 {
+                1.0  // Estructura confirmada
+            } else if criterios_cumplidos >= 2 {
+                0.5  // Evidencia moderada
+            } else {
+                0.0  // Evidencia débil
+            });
+        
+        Ok(resultados)
+    }
+
+    // ==============================================
+    // 8. MÉTODOS ADICIONALES DE ANÁLISIS
+    // ==============================================
+
+    /// Calcular la función de correlación angular para análisis de escala
+    #[pyo3(signature = (posiciones, bins_angular = None))]
+    fn calcular_correlacion_angular(
+        &self,
+        posiciones: Vec<[f64; 2]>,  // [RA, Dec]
+        bins_angular: Option<Vec<f64>>,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        let n = posiciones.len();
+        if n < 100 {
+            return Err(PyValueError::new_err("Muy pocas posiciones para análisis de correlación"));
+        }
+
+        // Bins angulares predeterminados (en grados)
+        let bins = bins_angular.unwrap_or_else(|| {
+            vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0]
+        });
+
+        // Calcular todas las distancias angulares
+        let mut distancias = Vec::new();
+        
+        for i in 0..n {
+            let pos1 = &posiciones[i];
+            for j in (i + 1)..n {
+                let pos2 = &posiciones[j];
+                let dist = distancia_angular(pos1[0], pos1[1], pos2[0], pos2[1]);
+                distancias.push(dist);
+            }
+        }
+
+        let n_pares = distancias.len() as f64;
+        let area_total = 4.0 * PI * (180.0 / PI).powi(2); // Área total en grados²
+
+        // Calcular histograma
+        let mut counts = vec![0.0; bins.len()];
+        let mut areas = vec![0.0; bins.len()];
+        
+        for &dist in &distancias {
+            for (i, &bin_max) in bins.iter().enumerate() {
+                let bin_min = if i == 0 { 0.0 } else { bins[i-1] };
+                
+                if dist >= bin_min && dist < bin_max {
+                    counts[i] += 1.0;
+                    
+                    // Área del anillo
+                    let area = 2.0 * PI * (dist.cos().to_radians() - (dist + bin_max - bin_min).cos().to_radians());
+                    areas[i] += area;
+                }
+            }
+        }
+
+        // Calcular función de correlación w(θ)
+        let mut w_theta = Vec::new();
+        let densidad_media = n as f64 / area_total;
+        
+        for i in 0..bins.len() {
+            let area_anillo = areas[i];
+            let esperado = densidad_media * area_anillo * n_pares / area_total;
+            
+            if esperado > 0.0 {
+                w_theta.push(counts[i] / esperado - 1.0);
+            } else {
+                w_theta.push(0.0);
+            }
+        }
+
+        let mut resultados = HashMap::new();
+        resultados.insert("bins_angular".to_string(), bins);
+        resultados.insert("w_theta".to_string(), w_theta);
+        resultados.insert("counts".to_string(), counts);
+        resultados.insert("n_objetos".to_string(), vec![n as f64]);
+        resultados.insert("n_pares".to_string(), vec![n_pares]);
+
+        Ok(resultados)
+    }
+
+    /// Análisis de la función de correlación en 3D
+    #[pyo3(signature = (estructuras, bins_mpc = None, h0 = 70.0))]
+    fn calcular_correlacion_3d(
+        &self,
+        estructuras: Vec<[f64; 3]>,  // [RA, Dec, Z]
+        bins_mpc: Option<Vec<f64>>,
+        h0: f64,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        let n = estructuras.len();
+        if n < 50 {
+            return Err(PyValueError::new_err("Muy pocas estructuras para correlación 3D"));
+        }
+
+        // Bins en Mpc predeterminados
+        let bins = bins_mpc.unwrap_or_else(|| {
+            vec![10.0, 30.0, 50.0, 100.0, 200.0, 300.0, 500.0, 800.0, 1200.0]
+        });
+
+        // Convertir a coordenadas cartesianas
+        let mut coordenadas = Vec::with_capacity(n);
+        let mut volumen_total = 0.0;
+
+        for estr in &estructuras {
+            let d_comov = distancia_comovil(estr[2], h0);
+            let ra_rad = estr[0].to_radians();
+            let dec_rad = estr[1].to_radians();
+
+            let x = d_comov * dec_rad.cos() * ra_rad.cos();
+            let y = d_comov * dec_rad.cos() * ra_rad.sin();
+            let z = d_comov * dec_rad.sin();
+
+            coordenadas.push([x, y, z]);
+            
+            // Estimación simple del volumen
+            volumen_total += (4.0/3.0) * PI * d_comov.powi(3);
+        }
+
+        // Calcular distancias 3D
+        let mut distancias = Vec::new();
+        
+        for i in 0..n {
+            let coord1 = &coordenadas[i];
+            for j in (i + 1)..n {
+                let coord2 = &coordenadas[j];
+                let dx = coord1[0] - coord2[0];
+                let dy = coord1[1] - coord2[1];
+                let dz = coord1[2] - coord2[2];
+                let dist = (dx*dx + dy*dy + dz*dz).sqrt();
+                distancias.push(dist);
+            }
+        }
+
+        let n_pares = distancias.len() as f64;
+        let densidad_media = n as f64 / volumen_total;
+
+        // Calcular histograma
+        let mut counts = vec![0.0; bins.len()];
+        let mut volúmenes = vec![0.0; bins.len()];
+        
+        for &dist in &distancias {
+            for (i, &bin_max) in bins.iter().enumerate() {
+                let bin_min = if i == 0 { 0.0 } else { bins[i-1] };
+                
+                if dist >= bin_min && dist < bin_max {
+                    counts[i] += 1.0;
+                    
+                    // Volumen del shell esférico
+                    let vol = (4.0/3.0) * PI * (bin_max.powi(3) - bin_min.powi(3));
+                    volúmenes[i] += vol;
+                }
+            }
+        }
+
+        // Calcular función de correlación ξ(r)
+        let mut xi_r = Vec::new();
+        
+        for i in 0..bins.len() {
+            let volumen_shell = volúmenes[i];
+            let esperado = densidad_media * volumen_shell * n_pares / volumen_total;
+            
+            if esperado > 0.0 {
+                xi_r.push(counts[i] / esperado - 1.0);
+            } else {
+                xi_r.push(0.0);
+            }
+        }
+
+        let mut resultados = HashMap::new();
+        resultados.insert("bins_mpc".to_string(), bins);
+        resultados.insert("xi_r".to_string(), xi_r);
+        resultados.insert("counts".to_string(), counts);
+        resultados.insert("volumes".to_string(), volúmenes);
+        resultados.insert("n_estructuras".to_string(), vec![n as f64]);
+        resultados.insert("n_pares".to_string(), vec![n_pares]);
+        resultados.insert("densidad_media".to_string(), vec![densidad_media]);
+
+        Ok(resultados)
+    }
+
+    /// Análisis de la función de potencia (power spectrum) usando FFT
+    #[pyo3(signature = (campo_densidad, tamano_celda_mpc, n_celdas))]
+    fn analizar_power_spectrum(
+        &self,
+        campo_densidad: Vec<f64>,  // Densidad en cada celda
+        tamano_celda_mpc: f64,
+        n_celdas: usize,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+        if campo_densidad.len() != n_celdas * n_celdas * n_celdas {
+            return Err(PyValueError::new_err("Tamaño del campo de densidad incorrecto"));
+        }
+
+        // Reorganizar en cubo 3D
+        let mut cubo = vec![vec![vec![0.0; n_celdas]; n_celdas]; n_celdas];
+        let mut idx = 0;
+        
+        for i in 0..n_celdas {
+            for j in 0..n_celdas {
+                for k in 0..n_celdas {
+                    cubo[i][j][k] = campo_densidad[idx];
+                    idx += 1;
+                }
+            }
+        }
+
+        // Calcular FFT 1D para cada dimensión (simplificado)
+        let n_bins = n_celdas / 2;
+        let mut power_spectrum = vec![0.0; n_bins];
+        let mut conteo_modos = vec![0; n_bins];
+        
+        // Coordenadas de Fourier
+        for i in 0..n_celdas {
+            let kx = if i <= n_celdas/2 { i as f64 } else { (i as f64) - (n_celdas as f64) };
+            
+            for j in 0..n_celdas {
+                let ky = if j <= n_celdas/2 { j as f64 } else { (j as f64) - (n_celdas as f64) };
+                
+                for k in 0..n_celdas {
+                    let kz = if k <= n_celdas/2 { k as f64 } else { (k as f64) - (n_celdas as f64) };
+                    
+                    // Magnitud del vector de onda
+                    let k_mag = (kx*kx + ky*ky + kz*kz).sqrt();
+                    
+                    // Bin en espacio k
+                    if k_mag > 0.0 && k_mag < (n_bins as f64) {
+                        let bin = k_mag.floor() as usize;
+                        if bin < n_bins {
+                            // Estimación simple de la potencia
+                            let valor = cubo[i][j][k];
+                            power_spectrum[bin] += valor * valor;
+                            conteo_modos[bin] += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Normalizar
+        for i in 0..n_bins {
+            if conteo_modos[i] > 0 {
+                power_spectrum[i] /= conteo_modos[i] as f64;
+            }
+        }
+
+        // Convertir k a unidades físicas
+        let k_max = (n_celdas as f64) / (2.0 * PI * tamano_celda_mpc * n_celdas as f64);
+        let k_values: Vec<f64> = (0..n_bins)
+            .map(|i| (i as f64) * k_max / (n_bins as f64))
+            .collect();
+
+        let mut resultados = HashMap::new();
+        resultados.insert("k_values".to_string(), k_values);
+        resultados.insert("power_spectrum".to_string(), power_spectrum);
+        resultados.insert("n_modos".to_string(), conteo_modos.iter().map(|&c| c as f64).collect());
+        resultados.insert("tamano_celda_mpc".to_string(), vec![tamano_celda_mpc]);
+        resultados.insert("n_celdas".to_string(), vec![n_celdas as f64]);
+
+        Ok(resultados)
+    }
+}
+
+// =================================================================
+// MÓDULO PYTHON
+// =================================================================
+
+#[pymodule]
+fn cristal_core(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    m.add_class::<CristalStacker>()?;
+    Ok(())
+}
