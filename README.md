@@ -41,44 +41,73 @@ JWST: Bouwens et al. (2023) photometry from 7 fields (CEERS, PRIMER, JADES, etc.
 
 
 # preprint (v1.0)
-JWST_A.py            
+
+JWST_A.py  
+          
 JWST_B.py
+
 eROSITA_fits_csv.py
+
 eROSITA_OMEGA.py
 
 
 # preprint (v1.2)
+
 FUNCTION_JWST.py 
-COEFICCIENT_JWST.py   
+
+COEFICCIENT_JWST.py
+   
 DERIVATIVE_PLOT.py 
 
+
 # preprint (v1.3)
+
 lib_rs.txt
+
 STRUCTURE_JWST.py
+
 STRUCTURE_JWST_v2.py
+
 OSC_JWST.py
+
 OSC_JWST_v3.py
 
 # preprint (v1.4)
+
 CCv8.py
+
 CCv8_1.py
+
 CCv8_2.py
+
 CCv8_3.py
+
 CCv8_4.py
+
 CCv0_4.py
-cristal_core.txt (kernel Rust) 
+
+cristal_core.txt (kernel Rust)
+ 
 dataset: SDSS DESI
 
 JWST_PREDICTOR.py
+
 JWST_PREDICTOR_v2.py
+
 TEST_CERO_JWST.py
+
 TEST_CERO_JWST_v2.py
+
 datasets: JWST
+
 kernel: unified_crystal_engine.txt
 
 # test
+
 SCANNER_JWST.py
+
 VOID_JWST.py
+
 STATISTICS_JWST.py
 
 
