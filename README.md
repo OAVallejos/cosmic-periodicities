@@ -67,7 +67,19 @@ CCv8_3.py
 CCv8_4.py
 CCv0_4.py
 cristal_core.txt (kernel Rust) 
-# dataset: SDSS DESI
+dataset: SDSS DESI
+
+JWST_PREDICTOR.py
+JWST_PREDICTOR_v2.py
+TEST_CERO_JWST.py
+TEST_CERO_JWST_v2.py
+datasets: JWST
+kernel: unified_crystal_engine.txt
+
+# test
+SCANNER_JWST.py
+VOID_JWST.py
+STATISTICS_JWST.py
 
 
 
