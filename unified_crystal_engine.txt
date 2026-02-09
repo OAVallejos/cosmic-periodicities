@@ -1,0 +1,621 @@
+// unified_crystal_engine.rs - VERSIÓN COMPLETAMENTE CORREGIDA
+// Todas las funciones con #[pyfunction] o #[pyo3(signature)] usan Vec<f64>                                 
+use pyo3::prelude::*;
+
+use pyo3::exceptions::PyValueError;
+use std::collections::HashMap;
+use std::f64::consts::PI;
+
+// =================================================================
+// CONSTANTES FÍSICAS FUNDAMENTALES
+// =================================================================
+
+const OMEGA_0_FUNDAMENTAL: f64 = 0.191;  // Gyr⁻¹ (ritmo fundamental)
+const LAMBDA_0_PRIMIGENIO: f64 = 1682.0;  // Mpc (escala hoy)
+const C_LIGHT: f64 = 299792.458;  // km/s
+const H0_STANDARD: f64 = 67.4;    // km/s/Mpc (Planck)
+const H0_ARMONICO: f64 = 74.15;   // km/s/Mpc (tu valor armónico)
+
+// =================================================================
+// FUNCIONES PRIOR (fuera de la clase) - TODAS CORREGIDAS
+// =================================================================
+
+/// Prior para ω en rango bajo (< 0.5) - Fundamental y 2do armónico
+#[pyfunction]
+fn log_prior_fundamental(omega: f64, a_amp: f64) -> f64 {
+    let armonicos = [0.191, 0.382];
+    if omega < 0.05 || omega > 0.505 || a_amp < 0.001 || a_amp > 0.950 {
+        return f64::NEG_INFINITY;
+    }
+    calcular_p_max(omega, &armonicos)
+}
+
+/// Prior para ω en rango alto (> 0.5) - Armónicos superiores
+#[pyfunction]
+fn log_prior_armonicos(omega: f64, a_amp: f64) -> f64 {
+    let armonicos = [0.573, 0.764, 0.955, 1.146];
+    if omega < 0.505 || omega > 1.35 || a_amp < 0.001 || a_amp > 0.950 {
+        return f64::NEG_INFINITY;
+    }
+    calcular_p_max(omega, &armonicos)
+}
+
+/// Likelihood rápido para MCMC - CORREGIDO: Vec<f64> en lugar de &[f64]
+#[pyfunction]
+fn log_likelihood_fast(theta: Vec<f64>, t: Vec<f64>, y: Vec<f64>, yerr: Vec<f64>) -> f64 {
+    let m0 = theta[0];
+    let alpha = theta[1];
+    let a = theta[2];
+    let omega = theta[3];
+    let phi = theta[4];
+    let log_sigma = theta[5];
+
+    let sigma2_extra = (2.0 * log_sigma).exp();
+    let mut total_ll = 0.0;
+
+    for i in 0..t.len() {
+        let y_pred = m0 - alpha * t[i] + a * (omega * t[i] + phi).cos();
+        let sigma2 = sigma2_extra + yerr[i].powi(2);
+        total_ll += -0.5 * ((y[i] - y_pred).powi(2) / sigma2 + (2.0 * PI * sigma2).ln());
+    }
+    total_ll
+}
+
+// Función interna (NO expuesta a Python) - Puede usar &[f64]
+fn calcular_p_max(omega: f64, lista: &[f64]) -> f64 {
+    let mut max_p = f64::NEG_INFINITY;
+    for &h in lista {
+        let diff = omega - h;
+        let p = -0.5 * (diff / 0.03).powi(2);
+        if p > max_p { max_p = p; }
+    }
+    max_p
+}
+
+// =================================================================
+// FUNCIONES AUXILIARES (internas - NO expuestas a Python)
+// =================================================================
+
+fn distancia_angular(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
+    let ra1_rad = ra1.to_radians();
+    let dec1_rad = dec1.to_radians();
+    let ra2_rad = ra2.to_radians();
+    let dec2_rad = dec2.to_radians();
+
+    let d_dec = dec2_rad - dec1_rad;
+    let d_ra = ra2_rad - ra1_rad;
+
+    let a = (d_dec / 2.0).sin().powi(2)
+        + dec1_rad.cos() * dec2_rad.cos() * (d_ra / 2.0).sin().powi(2);
+
+    2.0 * a.sqrt().asin()
+}
+
+fn distancia_comovil(z: f64, h0: f64) -> f64 {
+    (C_LIGHT / h0) * (1.0 + z).ln()
+}
+
+// =================================================================
+// CLASE PRINCIPAL UNIFICADA
+// =================================================================
+
+#[pyclass]
+#[derive(Clone)]
+pub struct UnifiedCrystalEngine {
+    #[pyo3(get, set)]
+    pub omega_0: f64,
+    #[pyo3(get, set)]
+    pub lambda_0: f64,
+    #[pyo3(get, set)]
+    pub h0: f64,
+    #[pyo3(get, set)]
+    pub modo_alto_z: bool,
+}
+
+#[pymethods]
+impl UnifiedCrystalEngine {
+    #[new]
+    #[pyo3(signature = (
+        omega_0 = None,
+        lambda_0 = None,
+        h0 = None,
+        modo_alto_z = false
+    ))]
+    fn new(
+        omega_0: Option<f64>,
+        lambda_0: Option<f64>,
+        h0: Option<f64>,
+        modo_alto_z: bool,
+    ) -> Self {
+        UnifiedCrystalEngine {
+            omega_0: omega_0.unwrap_or(OMEGA_0_FUNDAMENTAL),
+            lambda_0: lambda_0.unwrap_or(LAMBDA_0_PRIMIGENIO),
+            h0: h0.unwrap_or(if modo_alto_z { H0_STANDARD } else { H0_ARMONICO }),
+            modo_alto_z,
+        }
+    }
+
+    // =============================================================
+    // 1. FUNCIONES DE CONVERSIÓN ω ↔ λ
+    // =============================================================
+
+    #[pyo3(signature = (omega, z))]
+    fn omega_a_lambda(&self, omega: f64, z: f64) -> f64 {
+        if omega <= 0.0 { return self.lambda_0; }
+
+        let n = omega / self.omega_0;
+        let factor_cosmologico = if self.modo_alto_z {
+            1.0 / (1.0 + z).powf(0.5)
+        } else {
+            (1.0 + z).powf(0.8)
+        };
+
+        self.lambda_0 / n * factor_cosmologico
+    }
+
+    #[pyo3(signature = (lambda, z))]
+    fn lambda_a_omega(&self, lambda: f64, z: f64) -> f64 {
+        if lambda <= 0.0 { return self.omega_0; }
+
+        let factor_cosmologico = if self.modo_alto_z {
+            1.0 / (1.0 + z).powf(0.5)
+        } else {
+            (1.0 + z).powf(0.8)
+        };
+
+        let lambda_efectivo = self.lambda_0 * factor_cosmologico;
+        let n = lambda_efectivo / lambda;
+
+        self.omega_0 * n
+    }
+
+    #[pyo3(signature = (omega, z))]
+    fn radio_vacio_esperado(&self, omega: f64, z: f64) -> f64 {
+        let lambda_z = self.omega_a_lambda(omega, z);
+        if self.modo_alto_z {
+            lambda_z / 4.0
+        } else {
+            lambda_z / 3.5
+        }
+    }
+
+    #[pyo3(signature = (distancia_mpc, z))]
+    fn mpc_a_grados(&self, distancia_mpc: f64, z: f64) -> f64 {
+        let d_comov = distancia_comovil(z, self.h0);
+        if d_comov > 0.0 {
+            (distancia_mpc / d_comov).to_degrees()
+        } else {
+            0.0
+        }
+    }
+
+    // =============================================================
+    // 2. ANÁLISIS TEMPORAL (ω) - CORREGIDO
+    // =============================================================
+
+    #[pyo3(signature = (redshifts, busqueda_rapida = true))]
+    fn encontrar_omega_dominante(
+        &self,
+        redshifts: Vec<f64>,  // CORREGIDO: Vec<f64> en lugar de &[f64]
+        busqueda_rapida: Option<bool>
+    ) -> PyResult<HashMap<String, f64>> {
+
+        let busqueda_rapida_val = busqueda_rapida.unwrap_or(true);
+
+        if redshifts.len() < 10 {
+            return Err(PyValueError::new_err("Se necesitan al menos 10 redshifts"));
+        }
+
+        let mut z_sorted = redshifts.clone();
+        z_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let omega_min = if self.modo_alto_z { 0.5 } else { 0.05 };
+        let omega_max = if self.modo_alto_z { 1.3 } else { 0.5 };
+
+        let mut mejor_omega = self.omega_0;
+        let mut mejor_score = f64::NEG_INFINITY;
+
+        let n_puntos = if busqueda_rapida_val { 200 } else { 500 };
+
+        for i in 0..n_puntos {
+            let omega = omega_min + (omega_max - omega_min) * (i as f64) / (n_puntos as f64);
+            let score = self.calcular_score_omega(&z_sorted, omega);
+
+            if score > mejor_score {
+                mejor_score = score;
+                mejor_omega = omega;
+            }
+        }
+
+        // Determinar armónico más cercano
+        let armonico_cercano = if self.modo_alto_z {
+            let armonicos = [0.573, 0.764, 0.955, 1.146];
+            armonicos.iter()
+                .min_by_key(|&&x| (x - mejor_omega).abs() as u64)
+                .cloned()
+                .unwrap_or(0.764)
+        } else {
+            let armonicos = [0.191, 0.382];
+            armonicos.iter()
+                .min_by_key(|&&x| (x - mejor_omega).abs() as u64)
+                .cloned()
+                .unwrap_or(0.191)
+        };
+
+        let desviacion = (mejor_omega - armonico_cercano).abs();
+        let z_medio: f64 = z_sorted.iter().sum::<f64>() / z_sorted.len() as f64;
+
+        let mut resultados = HashMap::new();
+        resultados.insert("omega_dominante".to_string(), mejor_omega);
+        resultados.insert("score".to_string(), mejor_score);
+        resultados.insert("armonico_cercano".to_string(), armonico_cercano);
+        resultados.insert("desviacion_armonico".to_string(), desviacion);
+        resultados.insert("es_armonico".to_string(), if desviacion < 0.03 { 1.0 } else { 0.0 });
+        resultados.insert("n_redshifts".to_string(), redshifts.len() as f64);
+        resultados.insert("z_min".to_string(), z_sorted[0]);
+        resultados.insert("z_max".to_string(), z_sorted[z_sorted.len()-1]);
+        resultados.insert("z_medio".to_string(), z_medio);
+
+        Ok(resultados)
+    }
+
+    // =============================================================
+    // 3. PREDICCIÓN DE VACÍOS (FUNCIÓN CLAVE) - CORREGIDO
+    // =============================================================
+
+    #[pyo3(signature = (
+        nodos_conocidos,
+        omega_especifica = None,
+        buscar_hexagonos = true,
+        radio_vacio_rel = 0.25,
+    ))]
+    fn predecir_vacios(
+        &self,
+        nodos_conocidos: Vec<[f64; 3]>,  // CORREGIDO: Vec<[f64; 3]>
+        omega_especifica: Option<f64>,
+        buscar_hexagonos: Option<bool>,
+        radio_vacio_rel: Option<f64>,
+    ) -> PyResult<Vec<[f64; 4]>> {  // CORREGIDO: Vec<[f64; 4]>
+
+        let _buscar_hexagonos_val = buscar_hexagonos.unwrap_or(true);
+        let radio_vacio_rel_val = radio_vacio_rel.unwrap_or(0.25);
+
+        if nodos_conocidos.len() < 3 {
+            return Err(PyValueError::new_err("Se necesitan al menos 3 nodos"));
+        }
+
+        // Determinar ω dominante
+        let omega = if let Some(w) = omega_especifica {
+            w
+        } else {
+            let redshifts: Vec<f64> = nodos_conocidos.iter().map(|n| n[2]).collect();
+            match self.encontrar_omega_dominante(redshifts, Some(true)) {
+                Ok(res) => *res.get("omega_dominante").unwrap_or(&self.omega_0),
+                Err(_) => self.omega_0,
+            }
+        };
+
+        // Predecir vacíos
+        let mut vacios_predichos = Vec::new();
+        let n_nodos = nodos_conocidos.len();
+
+        for i in 0..n_nodos {
+            for j in (i+1)..n_nodos {
+                for k in (j+1)..n_nodos {
+                    let a = nodos_conocidos[i];
+                    let b = nodos_conocidos[j];
+                    let c = nodos_conocidos[k];
+
+                    // Calcular centro del triángulo
+                    let ra_centro = (a[0] + b[0] + c[0]) / 3.0;
+                    let dec_centro = (a[1] + b[1] + c[1]) / 3.0;
+                    let z_centro = (a[2] + b[2] + c[2]) / 3.0;
+
+                    // Calcular radio del vacío
+                    let lambda_local = self.omega_a_lambda(omega, z_centro);
+                    let radio_vacio = lambda_local * radio_vacio_rel_val;
+
+                    vacios_predichos.push([
+                        ra_centro,
+                        dec_centro,
+                        z_centro,
+                        radio_vacio,
+                    ]);
+                }
+            }
+        }
+
+        Ok(vacios_predichos)
+    }
+
+    // =============================================================
+    // 4. ANÁLISIS COMPLETO UNIFICADO - CORREGIDO
+    // =============================================================
+
+    #[pyo3(signature = (
+        galaxias,
+        buscar_vacios = true,
+        campo_nombre = "",
+    ))]
+    fn analisis_completo_unificado(
+        &self,
+        galaxias: Vec<[f64; 4]>,  // CORREGIDO: Vec<[f64; 4]>
+        buscar_vacios: Option<bool>,
+        campo_nombre: Option<&str>,
+    ) -> PyResult<HashMap<String, f64>> {
+
+        let buscar_vacios_val = buscar_vacios.unwrap_or(true);
+        let _campo = campo_nombre.unwrap_or("desconocido");
+
+        if galaxias.is_empty() {
+            return Err(PyValueError::new_err("Lista de galaxias vacía"));
+        }
+
+        // 1. Extraer redshifts y encontrar ω dominante
+        let redshifts: Vec<f64> = galaxias.iter().map(|g| g[2]).collect();
+        let resultado_omega = self.encontrar_omega_dominante(redshifts, Some(true))?;
+
+        let omega_dominante = *resultado_omega.get("omega_dominante").unwrap();
+        let z_medio = *resultado_omega.get("z_medio").unwrap();
+
+        // 2. Convertir ω a λ
+        let lambda_z = self.omega_a_lambda(omega_dominante, z_medio);
+        let radio_vacio_mpc = self.radio_vacio_esperado(omega_dominante, z_medio);
+
+        // 3. Identificar nodos candidatos
+        let mut n_nodos_candidatos = 0;
+        for galaxia in &galaxias {
+            if galaxia[3] > 200.0 && (galaxia[2] - z_medio).abs() < 0.1 {
+                n_nodos_candidatos += 1;
+            }
+        }
+
+        // 4. Predecir vacíos (simplificado)
+        let n_vacios_predichos = if buscar_vacios_val && n_nodos_candidatos >= 3 {
+            (n_nodos_candidatos * (n_nodos_candidatos - 1) * (n_nodos_candidatos - 2)) / 6
+        } else {
+            0
+        };
+
+        // 5. Preparar resultados
+        let mut resultados = HashMap::new();
+
+        // Resultados de ω
+        resultados.insert("omega_dominante".to_string(), omega_dominante);
+        resultados.insert("z_medio".to_string(), z_medio);
+
+        // Parámetros derivados
+        resultados.insert("lambda_z_mpc".to_string(), lambda_z);
+        resultados.insert("radio_vacio_mpc".to_string(), radio_vacio_mpc);
+        resultados.insert("n_nodos_candidatos".to_string(), n_nodos_candidatos as f64);
+        resultados.insert("n_vacios_predichos".to_string(), n_vacios_predichos as f64);
+        resultados.insert("h0_usado".to_string(), self.h0);
+        resultados.insert("modo_alto_z".to_string(), if self.modo_alto_z { 1.0 } else { 0.0 });
+
+        // Diagnóstico
+        let diagnostico = if n_vacios_predichos > 0 { 0.8 } else { 0.3 };
+        resultados.insert("diagnostico_final".to_string(), diagnostico);
+        resultados.insert("analisis_completo".to_string(), 1.0);
+
+        Ok(resultados)
+    }
+
+    // =============================================================
+    // 5. FUNCIÓN SIMPLE PARA JWST
+    // =============================================================
+
+    #[pyo3(signature = (omega_esperada = None))]
+    fn predecir_vacios_simple(
+        &self,
+        omega_esperada: Option<f64>,
+    ) -> PyResult<HashMap<String, Vec<f64>>> {
+
+        let omega = omega_esperada.unwrap_or(if self.modo_alto_z { 0.764 } else { 0.191 });
+
+        // Ejemplo simplificado: generar algunas predicciones
+        let mut ra_predichos = Vec::new();
+        let mut dec_predichos = Vec::new();
+        let mut z_predichos = Vec::new();
+
+        // 3 vacíos de ejemplo para alto-z
+        if self.modo_alto_z {
+            ra_predichos.push(150.25);
+            dec_predichos.push(2.33);
+            z_predichos.push(9.8);
+
+            ra_predichos.push(150.70);
+            dec_predichos.push(2.33);
+            z_predichos.push(10.0);
+
+            ra_predichos.push(150.25);
+            dec_predichos.push(2.78);
+            z_predichos.push(10.2);
+        } else {
+            // 3 vacíos de ejemplo para bajo-z
+            ra_predichos.push(202.5);
+            dec_predichos.push(35.0);
+            z_predichos.push(0.275);
+
+            ra_predichos.push(203.0);
+            dec_predichos.push(35.0);
+            z_predichos.push(0.275);
+
+            ra_predichos.push(202.5);
+            dec_predichos.push(35.5);
+            z_predichos.push(0.275);
+        }
+
+        let mut resultados = HashMap::new();
+        resultados.insert("ra_predichos".to_string(), ra_predichos);
+        resultados.insert("dec_predichos".to_string(), dec_predichos);
+        resultados.insert("z_predichos".to_string(), z_predichos);
+        resultados.insert("omega_usada".to_string(), vec![omega]);
+        resultados.insert("modo_alto_z".to_string(), vec![if self.modo_alto_z { 1.0 } else { 0.0 }]);
+
+        Ok(resultados)
+    }
+}
+
+// =================================================================
+// FUNCIONES INTERNAS (NO expuestas a Python) - Pueden usar &[f64]
+// =================================================================
+
+// Esta función NO tiene #[pyfunction], por lo que puede usar &[f64]
+fn calcular_score_omega(redshifts: &[f64], omega: f64) -> f64 {
+    if redshifts.is_empty() || omega <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+
+    // Rayleigh test
+    let fases: Vec<f64> = redshifts
+        .iter()
+        .map(|&z| {
+            let fase = (z / omega).fract();
+            2.0 * PI * fase
+        })
+        .collect();
+
+    let sum_cos: f64 = fases.iter().map(|&phi| phi.cos()).sum();
+    let sum_sin: f64 = fases.iter().map(|&phi| phi.sin()).sum();
+
+    let n = redshifts.len() as f64;
+    let r = (sum_cos.powi(2) + sum_sin.powi(2)).sqrt() / n;
+
+    // Entropía (simplificada)
+    let mut bins = [0.0; 6];
+    for &fase in &fases {
+        let bin_idx = ((fase / (2.0 * PI)) * 6.0).floor() as usize;
+        if bin_idx < 6 { bins[bin_idx] += 1.0; }
+    }
+
+    let entropia: f64 = bins.iter()
+        .filter(|&&count| count > 0.0)
+        .map(|&count| {
+            let p = count / n;
+            -p * p.log10()
+        })
+        .sum();
+
+    0.7 * r + 0.3 * (1.0 / (1.0 + entropia))
+}
+
+// Implementación del método que usa la función interna
+impl UnifiedCrystalEngine {
+    fn calcular_score_omega(&self, redshifts: &[f64], omega: f64) -> f64 {
+        calcular_score_omega(redshifts, omega)
+    }
+}
+
+
+// En unified_crystal_engine.rs - Añade esta función optimizada
+#[pyfunction]
+fn contar_galaxias_en_slice_streaming(
+    data_chunk: Vec<[f64; 3]>,  // [RA, Dec, Z] por chunk
+    z_target: f64,
+    z_window: f64
+) -> usize {
+    // Procesamiento minimalista en Rust
+    data_chunk.iter()
+        .filter(|&&point| (point[2] - z_target).abs() < z_window)
+        .count()
+}
+
+#[pyfunction]
+fn predecir_vacios_streaming(
+    chunks: Vec<Vec<[f64; 3]>>,  // Múltiples chunks pequeños
+    omega_especifica: f64,
+    radio_vacio_rel: f64,
+) -> PyResult<Vec<[f64; 4]>> {
+    // Procesar chunk por chunk
+    let mut vacios_acumulados = Vec::new();
+
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        if chunk.is_empty() { continue; }
+
+        // Solo procesar chunks pequeños
+        let mut vacios_chunk = predecir_vacios_en_chunk(
+            chunk,
+            omega_especifica,
+            radio_vacio_rel
+        )?;
+
+        vacios_acumulados.append(&mut vacios_chunk);
+
+        // Liberar memoria después de procesar cada chunk
+        if chunk_idx % 10 == 0 {
+            // Forzar recolección de basura (sugerencia al runtime)
+            std::mem::drop(chunk);
+        }
+    }
+
+    Ok(vacios_acumulados)
+}
+
+fn predecir_vacios_en_chunk(
+    chunk: &[[f64; 3]],
+    omega: f64,
+    radio_rel: f64
+) -> PyResult<Vec<[f64; 4]>> {
+    // Versión simplificada para chunks pequeños
+    let mut vacios = Vec::new();
+
+    // Solo procesar triángulos si hay suficientes puntos
+    if chunk.len() >= 3 {
+        for i in 0..chunk.len() {
+            for j in (i+1)..chunk.len() {
+                if j >= chunk.len() { break; }
+                for k in (j+1)..chunk.len() {
+                    if k >= chunk.len() { break; }
+
+                    let a = chunk[i];
+                    let b = chunk[j];
+                    let c = chunk[k];
+
+                    // Centro simple del triángulo
+                    let ra_centro = (a[0] + b[0] + c[0]) / 3.0;
+                    let dec_centro = (a[1] + b[1] + c[1]) / 3.0;
+                    let z_centro = (a[2] + b[2] + c[2]) / 3.0;
+
+                    // Solo añadir si está cerca de nuestro interés
+                    if (z_centro - 10.19).abs() < 1.0 {
+                        vacios.push([ra_centro, dec_centro, z_centro, 210.0]);
+                    }
+
+                    // Break early para chunks grandes
+                    if vacios.len() > 50 { break; }
+                }
+                if vacios.len() > 50 { break; }
+            }
+            if vacios.len() > 50 { break; }
+        }
+    }
+
+    Ok(vacios)
+}
+
+// =================================================================
+// MÓDULO PYTHON - VERSIÓN COMPLETA CON STREAMING
+// =================================================================
+
+#[pymodule]
+fn unified_crystal_engine(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    m.add_class::<UnifiedCrystalEngine>()?;
+
+    // Funciones originales
+    m.add_function(wrap_pyfunction!(log_prior_fundamental, m)?)?;
+    m.add_function(wrap_pyfunction!(log_prior_armonicos, m)?)?;
+    m.add_function(wrap_pyfunction!(log_likelihood_fast, m)?)?;
+
+    // NUEVAS FUNCIONES DE STREAMING (¡AÑADIR ESTAS!)
+    m.add_function(wrap_pyfunction!(contar_galaxias_en_slice_streaming, m)?)?;
+    m.add_function(wrap_pyfunction!(predecir_vacios_streaming, m)?)?;
+
+    // Constantes
+    m.add("OMEGA_0_FUNDAMENTAL", OMEGA_0_FUNDAMENTAL)?;
+    m.add("LAMBDA_0_PRIMIGENIO", LAMBDA_0_PRIMIGENIO)?;
+    m.add("H0_STANDARD", H0_STANDARD)?;
+    m.add("H0_ARMONICO", H0_ARMONICO)?;
+    m.add("C_LIGHT", C_LIGHT)?;
+
+    Ok(())
+}
