@@ -60,7 +60,7 @@ def load_real_data():
     try:
         # SDSS
         print("\n[1/6] 📂 Loading SDSS...")
-        data_sdss = np.load('sdss_vdisp_calidad.npz')
+        data_sdss = np.load('data/sdss_vdisp_calidad.npz')
         ra_sdss = data_sdss['RA'].astype(np.float64)
         dec_sdss = data_sdss['DEC'].astype(np.float64)
         z_sdss = data_sdss['Z'].astype(np.float64)
@@ -69,7 +69,7 @@ def load_real_data():
         # DESI
         print("[2/6] 📂 Loading DESI...")
         import astropy.io.fits as fits
-        hdul = fits.open('DATASET_LRG_VDISP_FLUXR_FINAL.fits')
+        hdul = fits.open('data/DATASET_LRG_VDISP_FLUXR_FINAL.fits')
         data = hdul[1].data
         ra_desi = data['RA'].astype(np.float64)
         dec_desi = data['DEC'].astype(np.float64)
