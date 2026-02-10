@@ -50,7 +50,7 @@ class CrystalAnalyzerV9:
         print("="*50)
 
         try:
-            data = np.load('sdss_vdisp_calidad.npz')
+            data = np.load('data/sdss_vdisp_calidad.npz')
 
             # Filter DURING loading to save memory
             ra = data['RA'].astype(np.float32)
