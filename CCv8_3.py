@@ -45,7 +45,7 @@ class OptimizedHybridDataset:
         self.H0 = H0
         self.c = 299792.458
 
-    def load_optimized_dataset(self, filepath: str = 'DATASET_LRG_VDISP_FLUXR_FINAL.fits',
+    def load_optimized_dataset(self, filepath: str = 'data/DATASET_LRG_VDISP_FLUXR_FINAL.fits',
                                  max_galaxies: int = 500000):
         """Load dataset optimized for AWS"""
 
