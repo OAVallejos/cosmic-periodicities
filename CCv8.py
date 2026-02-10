@@ -51,7 +51,7 @@ class CosmicCrystalAnalyzer:
         else:
             self.stacker = None
 
-    def load_original_dataset(self, path: str = 'sdss_vdisp_calidad.npz') -> bool:
+    def load_original_dataset(self, path: str = 'data/sdss_vdisp_calidad.npz') -> bool:
         """Load complete SDSS dataset"""
         print(f"\n📂 LOADING ORIGINAL DATASET: {path}")
         print("="*60)
