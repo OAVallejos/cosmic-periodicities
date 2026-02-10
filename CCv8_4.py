@@ -38,7 +38,7 @@ class EvolutionaryRustAnalyzer:
         else:
             print("⚠️  Running without Rust acceleration")
 
-    def load_sdss_npz(self, file='sdss_vdisp_calidad.npz'):
+    def load_sdss_npz(self, file='data/sdss_vdisp_calidad.npz'):
         """Load SDSS dataset in .npz format"""
         if not os.path.exists(file):
             print(f"❌ File {file} not found")
@@ -72,7 +72,7 @@ class EvolutionaryRustAnalyzer:
             print(f"❌ Error loading SDSS: {e}")
             return None
 
-    def load_desi_fits(self, file='DATASET_LRG_VDISP_FLUXR_FINAL.fits'):
+    def load_desi_fits(self, file='data/DATASET_LRG_VDISP_FLUXR_FINAL.fits'):
         """Load DESI dataset in .fits format"""
         if not os.path.exists(file):
             print(f"❌ File {file} not found")
