@@ -86,7 +86,7 @@ class SafeAnalyzer:
 
         try:
             # Load small sample
-            data = np.load('sdss_vdisp_calidad.npz')
+            data = np.load('data/sdss_vdisp_calidad.npz')
 
             # Take random sample of 50k galaxies
             n_total = len(data['RA'])
