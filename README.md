@@ -132,5 +132,5 @@ Analysis of Cosmic Crystalline Structure. (v1.4). Zenodo. https://doi.org/10.528
 
 Observational Evidence of Cosmic
 Periodicity
-in 85,390 Galaxies from SDSS-V and JWST
+in 85,390 Galaxies from SDSS-V and JWST (v1.5)
 https://doi.org/10.5281/zenodo.18916234
