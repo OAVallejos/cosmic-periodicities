@@ -111,6 +111,11 @@ VOID_JWST.py
 
 STATISTICS_JWST.py
 
+# preprint (v1.5)
+
+ANALYSIS_SPEC.py
+
+ANALYSIS_SPEC_v2.py
 
 
 ## 📜 Citation
@@ -123,3 +128,9 @@ Evidence for Cosmic Harmonic Periodicity in Galaxy. (v1.2). Zenodo. https://doi.
 Discovery of Cosmic Crystal Structure at High Redshift. (v1.3). Zenodo. https://doi.org/10.5281/zenodo.18475085
 
 Analysis of Cosmic Crystalline Structure. (v1.4). Zenodo. https://doi.org/10.5281/zenodo.18528720
+
+
+Observational Evidence of Cosmic
+Periodicity
+in 85,390 Galaxies from SDSS-V and JWST
+https://doi.org/10.5281/zenodo.18916234
