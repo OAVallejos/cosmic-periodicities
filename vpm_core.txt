@@ -1,0 +1,95 @@
+use pyo3::prelude::*;
+use std::f64::consts::PI;
+
+#[pyclass]
+pub struct VPMKernel {
+    #[pyo3(get, set)]
+    pub omega_0: f64,
+    #[pyo3(get, set)]
+    pub z_c: f64,
+    #[pyo3(get, set)]
+    pub xi: f64,
+    #[pyo3(get, set)]
+    pub target_alpha: f64,
+}
+
+#[pymethods]
+impl VPMKernel {
+    #[new]
+    fn new() -> Self {
+        VPMKernel {
+            omega_0: 0.191,
+            z_c: 0.21,
+            xi: 0.084,
+            target_alpha: 0.35,
+        }
+    }
+
+    /// Calcula dphi/dz en un punto específico de redshift
+    fn dphi_dz(&self, z: f64) -> f64 {
+        // Transición sigmoide (beta=30 para transición vítrea física)
+        let transition = 1.0 / (1.0 + ((-30.0 * (z - self.z_c)).exp()));
+        
+        // Evolución de modo: n=6 (alta z) -> n=1 (baja z)
+        let n_eff = 1.0 + (6.0 - 1.0) * transition;
+        
+        // Acoplamiento de torsión local (VPM)
+        let torsion_boost = 1.0 + self.xi * 5.0 * (1.0 - transition);
+        
+        // Damping de ley de potencia (preservación de señal de largo alcance)
+        let damping = 1.0 / (1.0 + z / 10.0);
+        
+        0.0015 * self.omega_0 * n_eff * torsion_boost * damping
+    }
+
+    /// Integra la birrefringencia acumulada desde z_max hasta 0
+    /// Retorna un vector con los valores de Delta Alpha para cada z
+    fn compute_birefringence(&self, z_vec: Vec<f64>) -> PyResult<Vec<f64>> {
+        let n = z_vec.len();
+        if n < 2 {
+            return Ok(vec![0.0; n]);
+        }
+
+        let mut dphi_values = Vec::with_capacity(n);
+        for &z in &z_vec {
+            dphi_values.push(self.dphi_dz(z));
+        }
+
+        // Integración trapezoidal acumulada
+        let mut integral = Vec::with_capacity(n);
+        let mut current_sum = 0.0;
+        integral.push(0.0);
+
+        for i in 1..n {
+            let dz = (z_vec[i] - z_vec[i - 1]).abs();
+            let avg_phi = (dphi_values[i] + dphi_values[i - 1]) / 2.0;
+            current_sum += avg_phi * dz;
+            integral.push(current_sum);
+        }
+
+        let total_area = current_sum;
+
+        // Normalización y Calibración al Target (0.35°)
+        // Mapea la integral para que en z=0 (fin del vector) sea target_alpha
+        let calibrated_birefringence: Vec<f64> = integral
+            .iter()
+            .map(|&val| {
+                if total_area > 0.0 {
+                    // Inversión para acumulación desde el pasado
+                    let accumulated = (val - integral[0]).abs();
+                    (accumulated / total_area) * self.target_alpha
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        Ok(calibrated_birefringence)
+    }
+}
+
+#[pymodule]
+fn vpm_core(_py: Python, m: &PyModule) -> PyResult<()> {
+    m.add_class::<VPMKernel>()?;
+    Ok(())
+}
