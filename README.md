@@ -117,6 +117,17 @@ ANALYSIS_SPEC.py
 
 ANALYSIS_SPEC_v2.py
 
+# preprint (v1.6)
+
+VPM_VCV48_A.py
+
+VPM_VCV48_B.py
+
+VPM_VCV48_C.py
+
+Kernel vpm_core.txt
+
+
 
 ## 📜 Citation
 If you use this code or data, please cite:
@@ -134,3 +145,7 @@ Observational Evidence of Cosmic
 Periodicity
 in 85,390 Galaxies from SDSS-V and JWST (v1.5)
 https://doi.org/10.5281/zenodo.18916234
+
+Observational Validation of the Primordial
+Vorticity Model (VPM-VCV) (v1.6)
+https://doi.org/10.5281/zenodo.19074632
